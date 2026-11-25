@@ -17,6 +17,8 @@
       "patterns": [
         "flash",
         "fmha",
+        "flex_attention",
+        "sdpa",
         "attn",
         "attention"
       ]
@@ -45,6 +47,8 @@
       "kind": "compute",
       "patterns": [
         "conv(?!ert)",
+        "deform.*conv",
+        "hipdnn",
         "miopen",
         "cudnn"
       ]
@@ -54,9 +58,14 @@
       "kind": "compute",
       "patterns": [
         "multi_tensor_apply",
+        "multi_tensor_adam",
+        "fused_adam",
         "adam(w)?_?functor",
         "adam_?(w|update)",
         "lamb_?(stage|functor)",
+        "muon",
+        "_mt_momentum",
+        "_mt_apply",
         "^sgd"
       ]
     },
@@ -69,6 +78,7 @@
         "rms_?norm",
         "batch_?norm",
         "group_?norm",
+        "lightop.*norm",
         "gammabeta",
         "cuapplylayernorm",
         "cucomputegrad"
@@ -173,9 +183,19 @@
     "transformers/",
     "accelerate/",
     "deepspeed/",
+    "diffusers/",
     "flash_attn/",
     "apex/",
     "triton/",
+    "mmcv/",
+    "mmdet/",
+    "mmdet3d/",
+    "mmengine/",
+    "timm/",
+    "peft/",
+    "einops/",
+    "lightop/",
+    "turbo_physai/",
     "numpy/",
     "scipy/",
     "pandas/",
