@@ -1,73 +1,63 @@
 # TurboPhysAI 跨模型同步消除证据
 
-以下来自静态读源码（本地克隆的固定提交），不代表运行时一定命中，也不代表正确性或性能已验证。"源码中的做法"表示改写本身已核实；带"源码自述"的句子是源码注释或文档里的原话，不是我们的测量；没有任何性能数字——所有数字均未重新测量。
+> **来源与核实边界**：
+> - 汇总仓库与分支：[zhaobx01/TurboPhysAI (`corpus/all-models`)](https://github.com/zhaobx01/TurboPhysAI/tree/corpus/all-models)
+> - 本次核实快照 SHA：`796d3f6bce`（基于官方 `HYGON-AI/TurboPhysAI` `main` `1eb24269da` + 13 个 Open PR，共覆盖 16 个模型）
+> - 本文件全部结论来自**静态对比本地 Before 基线源码与 After 实现源码**，不含未复测的性能收益；凡转述源码注释中的性能或次数说法，均标注 **「来源自述，未复测」**。外部链接仅作溯源参考，离线环境仍可完整使用本 Skill。
 
-固定提交：MapTRv2（zhaobx01/TurboPhysAI main）`bc8ced4`；BEVFormer、BEVFusion、Cosmos3（iMountTai/TurboPhysAI main）`bb302a6`；OpenWAM（iMountTai/TurboPhysAI feat/openwam）`e4528c3`；OpenVLA（xgbah/TurboPhysAI feat/openvla-optimization）`e7aaad0`；GR00T 为本地工作区快照（含未提交改动）。
+---
 
-## 已核实的案例
+## 1. 按机制分组的跨模型速查表
 
-### MapTRv2
+（可点击链接统一指向 `corpus/all-models` 分支对应文件，不写死行号，以关键函数/类名定位；同质模型合并列举，避免流水账。）
 
-- **损失归一化留在设备上**：三个 `*_head.loss_single`（`maptrv2_head`、`maptr_head`、`bevformer_head`）把正样本计数的 `.item()` 换成 `.reshape(())`：`num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).reshape(())`（`sync_elimination.py:119,255,376`）。改写前的 `.item()` 做法见同文档 `v5_GroupA.md` 的 A2 一节描述。
-- **删除布尔 mask 的冗余 `nan_to_num` 清洗**：`BEVFormerEncoder.point_sampling` 构造的 `bev_mask` 是 `torch.bool`，不可能含 NaN/Inf，所以原本按 PyTorch 版本分支调用的 `nan_to_num`（Torch 路径或旧版 NumPy 路径）被整段删除，只保留投影计算和可见性判断（`sync_elimination.py` 中 `bevformer_point_sampling`，对照 `v5_GroupA.md` A1）。`v5_GroupA.md` 自述：旧版 NumPy 分支"还涉及设备往返"；实机记录里 profiler 确认优化路径没有 `aten::nan_to_num` 事件，方法级微测墙钟中位数约 2.004 ms 对 1.998 ms，文档明确说"此微小差异仅为该环境的单次测量记录，不作为稳定加速承诺"。
-- **安装方式**：四个替换作为一个原子组安装，任一目标检查失败则整组不装（`v5_GroupA.md` 开头）。
-- **必须留在 CPU 的求解**：`assigner.py:142` 的 `_hungarian_match_impl` 对代价矩阵 `cost.detach().cpu()` 一次性搬运，`linear_sum_assignment` 的结果再一次性 `torch.as_tensor(..., device=device)` 搬回。这是 P7 模式，不是消除，是收敛成一次。
-- **优化器 step 标量**：`optimizer.py:31` 的 `_integer_step` 在校验 checkpoint 的 step 值时调用 `.item()`，这是加载时的一次性检查，不在训练热路径上，不建议作为消除对象。
+| 模式 | 机制子项 | 代表模型（原始 PR） | 基线 SHA | After 实现链接与关键符号 | 核实过的 Before 痛点 → After 要点 | 证据级别 | 同质 / 关联模型 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **P1** | 归一化标量留设备 + 删 bool 冗余清洗 | MapTRv2 (`#45`) | `e03f097abe` | [sync_elimination.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/maptrv2/sync_elimination.py) (`maptrv2_head_loss_single`, `bevformer_point_sampling`) | Before 调 `torch.clamp(reduce_mean(num_total_pos), min=1).item()` 且对 `torch.bool` `bev_mask` 做 `nan_to_num`（旧分支含 `.cpu().numpy()`）；After 改 `.reshape(())` 并删除冗余清洗 | 已核实改造案例 | 同文件另覆盖 `maptr_head`、`bevformer_head` |
+| **P1** | 绕开框架 getter 隐式 `.item()` | OpenWAM (`#27`) | `0c9ed80d80` | [host_async.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/openwam/host_async.py) (`device_grad_norm`) | Before 通过 Accelerate/DeepSpeed getter 取 `grad_norm` 触发 `.item()`；After 在校验 ZeRO-2 无 CPU offload 后直接读取设备端 `_global_grad_norm` 零维张量 | 已核实改造案例（受限/单框架参考：DeepSpeed ZeRO-2） | — |
+| **P2** | Qwen3-VL 视觉位置编码与 mRoPE 整段 CPU 化 + 缓存 | GR00T (`#41`) | `transformers` `47b0e478f3` | [qwen_position.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/groot/qwen_position.py) (`fast_pos_embed_interpolate`, `rot_pos_emb`, `get_rope_index`) | Before 在 `for` 循环内把 GPU 标量传入 `linspace`/`arange` 并反复 `.item()` / `argwhere`（注释称“数千次同步 D2H”，来源自述，未复测）；After 一次性 `.detach().to("cpu").tolist()`，CPU 构造并按 `grid_thw` 缓存 | 已核实改造案例 | LingBot-VLA-V2 (`#40`, [qwen3vl_cache_gridTHW.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/lingbot_vla_v2/qwen3vl_cache_gridTHW.py), [qwen3vl_rope_index_cpu.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/lingbot_vla_v2/qwen3vl_rope_index_cpu.py))；Cosmos3 (`#19`, [cosmos-framework.patch](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/model_examples/Cosmos3/cosmos-framework.patch) `qwen3_vl_hcu.py`) |
+| **P2** | 搬运边界拦截元数据留在 CPU | Cosmos3 (`#19`) | `9726697a83` | [cosmos-framework.patch](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/model_examples/Cosmos3/cosmos-framework.patch) (`cosmos_framework/utils/misc.py` `to`) | Before 将整个 batch 含 `image_size` 一并上卡；After 仅将 `image_size` 留在 CPU，其余字段正常上卡 | 已核实改造案例 | OpenWAM (`#27`, [ports/encode.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/openwam/ports/encode.py) 在 CPU 侧算文本长度) |
+| **P3** | 布尔掩码索引改为显式索引 `index_select` | BEVFusion (`main`) | `326653dc06` | [common/mmdet3d/bev_pool.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/common/mmdet3d/bev_pool.py) (`quick_cumsum_forward`, `quick_cumsum_backward`) | Before `QuickCumsum` 直接用 `x[kept], geom_feats[kept]` 与 `back[kept] -= 1`；After 改用 `nonzero().flatten()` + `index_select` 与 `back -= kept.to(back.dtype)` | 已核实改造案例 | — |
+| **P3** | 删除 `nonzero` 后冗余 `.unique()` | PointPillars (`#33`) | `fe25f7a51d` | [unique_free_sampler.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/pointpillars/unique_free_sampler.py) (`unique_free_sampler_wrapper`) | Before `PseudoSampler.sample` 对 `torch.nonzero(...).squeeze(-1)` 额外调用 `.unique()`；After 直接去除冗余 `.unique()` | 已核实改造案例 | — |
+| **P4** | 满足前提时绕开 FA2 varlen/unpad 同步 | OpenVLA (`main`) | `c8f03f48af` | [skip_fa2_unpad.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/openvla/skip_fa2_unpad.py) (`make_fast_fa2_causal_mask_wrapper`) | Before 走 FA2 varlen 需每步 `nonzero` + `seqlens.max().item()`（来源自述，未复测）；After 在 FA2 + prefill + 右 padding 时返回 `None` 跳过，左 padding 显式回退 | 实现参考，基线待核实（旧版 `transformers` `_update_causal_mask`） | Cosmos3 (`#19`, `flash2/functions.py` 直传/缓存 `cu_seqlens`) |
+| **P5** | 梯度累积微步跳过 `.item()` | DiT4DiT (`#28`) | `d8854a1171` | [training.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/dit4dit/training.py) (`_train_step`) | Before 每个 micro-step 末尾都对 3–4 个 loss 调 `.item()`，但外层仅在 `sync_gradients=True` 时消费；After 在 `not sync_gradients` 时直接 `return {}` | 已核实改造案例 | — |
+| **P5** | 前向延迟 `.detach()` 到日志边界（成组原子） | LeRobot-ACT (`#44`) | `3f2179f3b6` | [deferred_metrics.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/lerobot_act/deferred_metrics.py) (`deferred_metrics_policy_forward`, `deferred_metrics_wandb_wrapper`) | Before `ACTPolicy.forward` 每次前向都执行 `l1_loss.item()` / `mean_kld.item()`；After 返回 `.detach()` 设备张量，仅在 `WandBLogger.log_dict` 边界才 `.item()` | 已核实改造案例 | — |
+| **P5** | 多标量合并单次归约与单次 D2H | BEVFusion (`main`) | `326653dc06` | [training.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/bevfusion/training.py) (`parse_losses`) | Before 循环内逐个 loss `dist.all_reduce` + `.item()`；After `torch.stack` 后单次 `all_reduce` + 单次 `reduced.cpu().tolist()` | 已核实改造案例 | — |
+| **P5 + P8** | pinned buffer + `cuda.Event` 延迟一步读取 | OpenWAM (`#27`) | `0c9ed80d80` | [host_async.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/openwam/host_async.py) (`LaggedMetrics`, `upload`) | Before 每步阻塞 `.item()` 读 loss/grad_norm；After `stack` 后异步拷入 `pin_memory=True` host buffer，下一步 `push` 时再 `event.synchronize()` + `.tolist()` | 已核实改造案例 | — |
+| **P6** | 梯度累积微步移除多余 `dist.barrier()` | LingBot-VA (`#34`) | `7c6ffa9bfc` | [train_sync.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/lingbot_va/train_sync.py) (`train`, `sync_wrapper`) | Before `wan_va/train.py` 将 `dist.barrier()` 放在 `if losses['should_log']:` 之外，每个 micro-step 都全卡同步；After 仅在 `should_log` 步执行 `barrier()` | 已核实改造案例 | OpenWAM (`#27`, `host_async.configure_deepspeed` 关闭 DeepSpeed `timers.throughput` 同步) |
+| **P7** | 必须留在 CPU 的匈牙利匹配收敛为单次 D2H/H2D | MapTRv2 (`#45`) | `e03f097abe` | [assigner.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/maptrv2/assigner.py) (`_hungarian_match_impl`) | 代价矩阵一次性 `.detach().cpu()`，匹配结果一次性 `torch.as_tensor(..., device=device)` 搬回，隔离于编译图外 | 已核实改造案例 | BEVFusion (`main`, [transfusion.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/bevfusion/transfusion.py)) |
 
-### BEVFusion
+---
 
-- **loss 聚合单次 all_reduce 加单次 `cpu().tolist()`**：`parse_losses`（`training.py:39-64`）把所有标量 loss 堆成一个张量，做一次 `dist.all_reduce`，最后一次 `reduced.cpu().tolist()`，取代逐个 loss 分别 `.item()`。
-- **Hungarian 匹配单次 D2H/H2D**：`transfusion.py:505-519` 的 assign 函数对代价矩阵 `(...).detach().cpu()`，`linear_sum_assignment` 结果 `np.stack(...)` 后 `torch.from_numpy(...).to(bboxes.device)` 一次性搬回，再 `.unbind(0)` 拆成两个索引张量。同 P7 模式。
-- **BEVPool 用 `where`/`index_select` 替代布尔索引**：`common/mmdet3d/bev_pool.py` 的 `NativeQuickCumsumCuda.forward`（约 36-50 行）用 `interval_starts = torch.where(kept)[0].int()` 得到索引；`quick_cumsum_forward`（约 84-96 行）用 `kept_indices = torch.nonzero(kept, as_tuple=False).flatten()` 配合 `torch.index_select` 读写，而不是 `x[kept]` 式的布尔索引。"改写前"是推断（未看到对应的旧版实现），按 P3 模式收录，标注为"源码中的做法"而非对照验证。
+## 2. 高价值代表案例与陷阱细节
 
-### BEVFormer
+### 2.1 Qwen3-VL 位置编码 CPU 化与缓存边界（GR00T `#41` / LingBot-VLA-V2 `#40`）
+- **核实要点**：Before（`transformers` `47b0e47` `modeling_qwen3_vl.py`）在 `fast_pos_embed_interpolate`、`rot_pos_emb`、`get_rope_index` 三处均存在 GPU 张量进入 Python `for` 循环逐元素读取的问题。
+- **实战陷阱**：`LingBot-VLA-V2` 对查表函数额外加了 `@torch._dynamo.disable` 并设缓存上限 `_POS_EMBED_CACHE_LIMIT = 16`（满则清空，防止动态分辨率场景显存泄漏）；`GR00T` 在 `get_rope_index` 中保留纯文本单模态分支走回原路径，并在缓存前检查 `not torch.jit.is_tracing()`。
 
-- **SCA 预取路径把 `.max().item()` 移到数据侧**：`geometry_sca.py:277-296` 的 `encoder_forward` 先尝试 `_prefetched_sca_inputs`；命中时直接用预取的 `indexes`/`index_lengths`，不执行现场的 `int(index_lengths.max().item())`（`:285`）。预取侧对应的 `_prepare_bev_meta_group`（`data.py:260` 附近）在 CudaPrefetchLoader 的后台线程里用 numpy 数组算出同样的分桶结果，不在 GPU 上同步。
-- **仍存在的同步点（候选，未验证是否常被触发）**：`geometry_sca.py:285` 的现场路径——验证/测试 loader 不走预取包装时，仍会执行 `.max().item()`。
-- **DataLoader 异步 H2D**：`CudaPrefetchLoader`（`data.py:33-124` 附近）用独立 CUDA stream、`pin_memory`、`non_blocking=True` 搬运，配合 `cuda.Event` 让主线程只在真正取数据时等待一次，而不是在 `.cuda()` 调用处隐式同步。
+### 2.2 前向延迟指标的强耦合原子性（LeRobot-ACT `#44`）
+- **核实要点**：`deferred_metrics.py` 把 `ACTPolicy.forward` 里的 `.item()` 改为 `.detach()` 后，必须同步包装下游日志消费点 `WandBLogger.log_dict` 做 `isinstance(..., torch.Tensor)` 转换。
+- **实战陷阱**：如果只改前向不改消费端，日志序列化或 JSON/WandB 上报会直接报错；因此必须作为**强耦合原子组**成对启停（源码里也显式禁止单独开关组内子选项）。
 
-### Cosmos3
+### 2.3 延迟指标与异步集合通信共存时的 `record_stream` 保护（OpenWAM `#27`）
+- **核实要点**：`host_async.LaggedMetrics._gather_aside` 在与 `deferred_gather` 共存时，不能在主训练 stream 上直接做指标 `all_gather`（否则会被 rank 偏斜卡住），而是改用独立 `cuda.Stream` 执行 `work.wait()` + `host.copy_(..., non_blocking=True)` + `event.record(self.stream)`。
+- **实战陷阱**：`values` 和 `gathered` 在主训练 stream 分配、在 side stream 消费，必须调用 `values.record_stream(self.stream)` 和 `gathered.record_stream(self.stream)`，否则 PyTorch 缓存分配器可能提前回收显存导致静默读脏数据。
 
-- **让 CPU 侧元数据留在 CPU**：`batch_transfer.py` 包装 `misc.to(...)`，只有同时满足"HIP 构建、显式传 `device`、没有传 `dtype`/`memory_format`/额外 kwargs、`data` 是 Mapping 且含 `image_size`"时，才把 `image_size` 单独 `original(value, device="cpu")`，其余字段正常搬到目标 device；不满足任一条件就透传给原函数（`batch_transfer.py:28-55`，已读完整函数体确认条件判断和 fallback 路径）。
-- **自建 `cu_seqlens` 绕开 `.max().item()`**：`mot_attention.py` 里的 `_sdpa`（约 330-354 行）对单条打包序列（batch=1）直接构造 `cu_seqlens_q = torch.cat([zero, torch.tensor([n_q], ...)])`，而不经过上游 `generate_varlen_parameters`。源码注释原话："The frontend derives cumulative offsets from seqlens via `generate_varlen_parameters`, which calls `.max().item()` (a device-host sync) and is explicitly disallowed inside a torch.compile region."，并用 `torch._check(n_q > 0)` 显式声明前提。这一处同时服务于"避免图中断"（torch.compile 区域内不允许 `.item()`）和"避免同步"两个目的。
-- **按 `grid_thw` 缓存辅助量，避免每步重新读取**：`qwen.py`（约 204-227 行）的 VisionModel 用 `(grid_thw.device, tuple(grid_thw.flatten().tolist()))` 做键的 FIFO 缓存，复用 `rotary_pos_emb`/`cu_seqlens`/`chunk_lengths`。这里仍有一次 `.tolist()` 用于算缓存 key，但避免了缓存未命中时重复执行的 `repeat_interleave + cumsum + pad + tolist` 链条。
-- **多模态 RoPE 索引整段放在 CPU**：`qwen.py` 的 `get_rope_index`（约 286-389 行）先把 `input_ids`/`grid_thw`/`attention_mask` 全部 `.cpu()`，所有数据相关的索引逻辑在 CPU 完成，最后一次性 `.to(target_device)`。前提是这类调用通常只发生在 prefill 阶段，频率低，小张量的 H2D 开销可以接受。
-- **timestep 用 pinned 非阻塞拷贝喂给 CPU 侧打包逻辑**：`omni_model.py`（约 256-260 行起）`timesteps_vision.to("cpu", non_blocking=True)`（仅当 `is_cuda`），结果传给 `_pack_input_sequence`，在 CPU 上继续构造。已确认消费方（`_pack_input_sequence` 及后续 `sample_ts[i:i+1].expand(...)` 的构造）都在 CPU 上进行，没有在拷贝完成前读取的风险；但该函数本身是否在所有调用路径上都确认了 pinned 来源，未逐一追溯到 `timesteps_vision` 的分配处，标注为部分验证。
+### 2.4 局部回退路径残留同步点（BEVFormer `main`）
+- **核实要点**：[geometry_sca.py](https://github.com/zhaobx01/TurboPhysAI/blob/corpus/all-models/turbo_physai/optimizations/models/bevformer/geometry_sca.py) (`encoder_forward`) 优先走预取好的 `_prefetched_sca_inputs` 避开现场 `int(index_lengths.max().item())`，但在未启用预取的验证/测试 loader 路径上仍会回退触发 `.item()`——排查时务必确认实测走的是哪条分支。
 
-### OpenWAM
+---
 
-- **`host_async` 组（默认关，`settings.py:63`）**：模块 docstring 原话："The default loop reads loss/grad-norm with .item() every step, DeepSpeed's throughput timer calls cuda.synchronize() inside engine.step, and a few small CPU tensors are uploaded with blocking copies."（`host_async.py:5-13`）。
-  - `configure_deepspeed` 关闭 DeepSpeed 吞吐计时器的同步（`timers["throughput"] = {"enabled": False, "synchronized": False}`，`host_async.py:24-31`）。
-  - `LaggedMetrics.push`（`host_async.py:49-87`）把 loss 三项和 grad_norm 堆成一个零维张量数组，拷到 `pin_memory=True` 的 host buffer，用 `cuda.Event` 记录；`flush`（`:113-130`）在下一次 `push` 时才 `event.synchronize()` 并一次性 `host.tolist()`，即延迟一步读取（P5 模式）。
-  - 分布式场景下有 `_gather_aside`（`:89-111`），在独立 `cuda.Stream` 上做 `all_gather_into_tensor` 并等待，避免训练主 stream 被这个小集合通信卡住。
-  - `upload`（`:34-39`）对 CPU 源张量先 `pin_memory()` 再 `non_blocking=True` 搬运，非 CPU 源则走普通 `.to()`。
-  - `rope_freqs`（`:133-143`）按 `(grid, device)` 缓存设备端 RoPE 表，避免每次重建。
-- **文本长度在 CPU 上算，避免 `.tolist()` 读 GPU 张量**：`text.py` 的 `_build_padding_plan`（约 94-105 行）和 `t5_prefix_plan` 相关逻辑（约 120-137 行）都在 CPU 上计算长度；`ports/encode.py:50-67` 用 `host_lengths = mask.gt(0).sum(dim=1).long() if cpu_plan else None`，消费时 `host_lengths.tolist()` 只在已经是 CPU 张量时调用。`text_trim` 组默认开（`settings.py:47`），在 `text.py:140-163` 里把 mask 先 `keep_cpu = mask.detach().to(device="cpu")` 再在 CPU 上找裁剪边界。
-- **未找到**：`ports/vae.py` 和 `pointwise.py` 里没有命中 `.item()`/`.cpu()`/`.tolist()`/`non_blocking`/`synchronize`/`nonzero`/`masked_select`/`timestep`/`sigma`/`scheduler` 等关键词（已用 grep 核实），说明 OpenWAM 的同步消除集中在训练循环和文本/MoT 侧，VAE 与采样路径这次没有发现对应改动。
+## 3. 正确性保护、未发现项与邻近方向排除
 
-### OpenVLA
-
-- **跳过 FA2 unpad 路径避免 varlen 的 `.max().item()`**：`skip_fa2_unpad.py` 包装 `LlamaModel._update_causal_mask`；当 `flash_attention_2` + 有显式 mask + `past_seen_tokens==0` + 右 padding（`attention_mask[:, 0].all().item()`）时直接返回 `None`，让 FA2 不再进入 varlen/unpad 路径。源码注释原话（`skip_fa2_unpad.py:14-27`）："The `.item()` is a scalar D2H sync, far cheaper than the one this Group removes: the varlen path needs a data-dependent `torch.nonzero` plus `seqlens_in_batch.max().item()` on every step."——即改写后仍保留一次标量同步（判断是否右 padding），但去掉了 varlen 路径里"每步一次 `nonzero` 加 `.max().item()`"。左 padding 的批次会显式回退到原函数，不是静默改变行为。
-
-### GR00T
-
-- **Qwen3-VL 视觉位置预处理整段放在 CPU**：`qwen3_backbone.py` 的 `_apply_cpu_position_preprocessing`（约 404-441 行）把 `visual.fast_pos_embed_interpolate`、`visual.rot_pos_emb`、`rope_model.get_rope_index` 替换成 CPU 版本（`_cpu_fast_pos_embed_interpolate:142`、`_cpu_rot_pos_emb:211`、`_cpu_get_rope_index:248`），并保留 `_gr00t_original_get_rope_index` 以便文本单模态路径走回原实现。相邻注释原话（约 395 行）提到要避免"thousands of synchronous scalar DtoH copies per forward"。这是本次读到的、措辞最直接的同步消除案例，但本次没有重新测量，也没有对照验证"数千次"这个说法。
-- 该文件里还有 `_apply_vision_patch_embed_channels_last`（约 443-477 行），那是内存布局优化，不是同步消除，不要混为一谈。
-
-## 候选，未验证（仅静态扫描/阅读命中，未逐一确认运行时行为）
-
-- Cosmos3 `losses.py` 约 115-120 行：HIP 路径用 `ordered_all_reduce` 对齐 RCCL 顺序（通信顺序问题，不是同步消除），但紧接着的 rank0 日志仍会对 `loss_avg` 调用 `.item()`，这一处本身未被消除。
-- Cosmos3 `checkpoint_dcp.py` 约 149、208 行：出现 `self.staging_stream.synchronize()` 和 `dist.barrier()`，这些是 checkpoint 保存流程里显式需要的同步点，未被作为消除对象处理，也不一定应该被消除。
-- BEVFusion `transfusion.py` 约 337-385 行：训练目标生成（Gaussian heatmap）把 GT 搬到 CPU 循环绘制再搬回 GPU，减少了逐元素的标量同步，但整体仍有一次 D2H（`gt_bboxes_cpu.cpu()`）和一次 H2D（`heatmap_cpu.to(device, non_blocking=True)`）；是否命中取决于 GT 数量和调用频率，未重新测量。
-- BEVFormer 非预取路径（`geometry_sca.py:285`）：如上所述，验证/测试 loader 大概率仍会触发 `.item()`。
-- MapTRv2、BEVFusion 里是否还有自定义 CUDA/HIP 扩展内部含 `cudaStreamSynchronize`/`hipStreamSynchronize`：本次阅读停在 Python 绑定层，没有读扩展的 C++/HIP 源码，未验证。
-
-## 邻近但不是同步消除的话题（仅指向）
-
-- Cosmos3 `sequence_packing.py` 的 FlashAttention `max_seqlen` 分桶（约 15-37 行）：目的是减少 `torch.compile` 因 Python int guard 变化而重编译，属于编译稳定性，不是同步消除；但它和 P4 模式用的是同一类"自己构造 varlen 参数"的手法，值得对照着看。
-- OpenWAM 的 `deferred_gather.py`、`zero.py` 里的双缓冲 `cuda.Event`，以及 `common/pytorch` 下通用的 FSDP ordered all-gather/reduce-scatter：解决的是分布式集合通信的顺序与重叠问题（RCCL/NCCL 要求同 communicator 全局顺序一致），不是 host-device 同步；不要把"有序调度"和"消除同步"混为一谈。
-- channels-last、AOT 编译相关的改动（见 `optimize-channels-last` skill）：即使文档里提到"避免了某次拷贝"，那通常是设备内的内存布局转换，不是 D2H/H2D 同步。
-
-## 与现有 compile 相关 skill 的对照
-
-`torch-compile-integration`（见本仓库同名 skill）主要覆盖"哪里加 `torch.compile`、图中断诊断、重编译、嵌套编译"，只在一处提醒"`.item()` 等可能触发图中断或同步，需要实测"，没有把同步消除本身当作系统主题，也没有收录上述任何具体案例（如 `host_async.py`、`batch_transfer.py`、`skip_fa2_unpad.py` 等）。本 skill 和它的边界是：凡是"在 `torch.compile` 捕获区域内因为 `.item()`/动态分支导致图中断或报错"，优先交给 compile 相关 skill 的图中断诊断；凡是"在 eager 路径或编译区域之外发生的阻塞 D2H/H2D、或库内部默认同步"，属于本 skill。两者在 Cosmos3 的 `mot_attention.py` 和 `sequence_packing.py` 上有交集，上面已分别说明。
+- **「正确性保护（非提速）」——不应作为提速项删除**：
+  - `Cosmos3` `checkpoint/dcp.py` 中的 `allocation_failed = bool(failed.item())`、`staging_stream.synchronize()` 与 `dist.barrier()` 属于分布式 checkpoint 一致性保护；
+  - `MapTRv2` `optimizer.py` 加载 checkpoint 校验 step 的一次性 `.item()` 不在训练热路径上。
+- **本次覆盖范围内未发现项**：
+  - `OpenWAM` `ports/vae.py` 与 `pointwise.py` 未发现步内标量 D2H 同步改造；
+  - `Sparse4D` 的 `instance_bank.py` / `grid_mask.py` 及 `FlashOCC` / `OpenPI` / `DreamZero` 主要优化集中在编译、算子、布局、显存或数据管线，未发现独立的步内 D2H 同步消除模块（`Sparse4D instance_bank.py` 有一处将 `new_tensor(self.default_time_interval)` 改为直接传标量给 `torch.where`，避免单步小 H2D）。
+  - C++/HIP 扩展源码内部是否含显式 `hipStreamSynchronize` 未在本次 Python 层静态核实范围内。
+- **邻近但归属其他方向（本 Skill 不收纳）**：
+  - **DataLoader / batch 级异步 H2D 预取**：`BEVFormer`/`BEVFusion` `CudaPrefetchLoader`、`LeRobot-ACT` `nonblocking_h2d.py` & `h2d_prefetch_stream.py`、`MapTRv2` `datacontainer_pin.py`、`FlashOCC` `pin_memory.py` → 归**数据管线**方向；
+  - **编译期 `max_seqlen` 分桶 / 定长 padding**：`Cosmos3` `sequence_packing.py`、`GR00T` `fixed_padding.py`、`OpenVLA` `text_len_bucket.py` → 归 `torch-compile-integration`；
+  - **分布式通信重叠与有序调度**：`OpenWAM` `deferred_gather.py`、`GR00T` `zero2_*.py`、`LingBot-VLA-V2` `split_root_fsdp.py` → 归**分布式通信**方向。
