@@ -30,6 +30,7 @@
 | BEVFusion | backbone 实例、模块类、检测头方法和小 helper，包装对象不同 | [八个目标](bevfusion-compile-case-study.md#八个编译目标) |
 | MapTRv2 | 按几何、查询初始化与解码阶段拆分；不能按函数数量推算图数 | [历史入口](maptrv2-case-study.md#19-个编译入口与-2-个-eager-边界) |
 | OpenWAM | MoT 联合 block、VAE encoder.forward 和小函数编译；与类包装或 AOT 不等价 | [五类入口](openwam-compile-case-study.md#五类直接编译入口) |
+| LingBot-VLA-V2 / FlashOCC / LeRobot-ACT | 按子系统/阶段独立开关（Vision 逐 block、Text 逐层、Action Expert 分支、Teacher 整体，或 BEV/OCC 阶段分别开关） | [16 模型总索引](turbophysai-compile-evidence.md) |
 
 **最小验证**：选一个首选及必要备选，记录匹配对象/数量、正确性、编译准备成本、稳态与端到端指标；没有足够证据可以暂缓。边界比较规则见 [决策参考](decisions.md#比较边界)。
 
@@ -68,6 +69,7 @@
 | Cosmos3 | 缓存上限由 `compile_options.py` 统一抬高：传入的 recompile_limit 取不低于 64，cache_size_limit 不低于 512。例如 recipe 传 8 也按 64 生效。这是对已有分桶的兜底，不是去特化的手段 | [C08](cosmos3-compile-case-study.md#源码与配置对应表) |
 | OpenWAM | SAC 的 `_call` 始终经 `torch.compiler.disable` 进入。源码注释称，触顶回退到 eager 的区域不能让 Dynamo 再追踪 SAC 区域；薄分派器另用 `skip_code` 避免按可调用对象重复编译，直到 recompile_limit | [内外层分派](openwam-compile-case-study.md#内外层分派与-checkpoint-状态) |
 | MapTRv2 | 静态 assigner 把 GT 侧补到固定长度，DDP 的 `static_graph=True` 假定每步自动求导图不变，源码称两者要同开或同关；该约束写在 `ddp.py` 与 `catalog.py` 的 `_STATIC_ASSIGNER_CONDITION` 中，本次未运行确认 | [GT 契约](maptrv2-case-study.md#重点契约固定容量-gt-并非只加装饰器) |
+| GR00T | 入口定长补齐至 156（`pad_156`）稳住编译图，但将 VL Dropout 抽成 `@torch.compiler.disable` 的 `CollatorWidthDropout` 在原始 collator 宽度上执行再 pad 回，避免 padding 破坏 dropout 语义 | [16 模型总索引](turbophysai-compile-evidence.md) |
 
 **最小验证**：测零、桶两侧、上限与超限，检查有效元素映射、mask、输出/梯度；记录预热后重编译、版本数及内存。先后使用相同输入分布，不用更规整数据制造收益。
 
@@ -95,6 +97,7 @@
 | MapTRv2 | CPU 匹配与 NumPy/PIL 随机增强保留 eager；调用与状态各自核对 | [eager 边界 M01/M21](maptrv2-case-study.md#19-个编译入口与-2-个-eager-边界) |
 | BEVFusion | 位置编码、FFN 方法和深度 Softmax 显式 disable，不受同一编译关闭变量控制 | [三个 eager 边界](bevfusion-compile-case-study.md#三个显式-eager-边界) |
 | OpenWAM | Attention/SAC 的局部 eager 与 MoT fullgraph 条件关联，但两者判定不完全相同 | [动态性与边界](openwam-compile-case-study.md#动态标记与-eager-边界) |
+| DiT4DiT / GR00T | DiT4DiT 原地 `action.compile(options={"fallback_random": True, "alignment_asserts": False})` 并前置检查选项存在性；GR00T 将 `AttentionInterface._global_mapping.flash_attention_2` 注册表项一并 `disable`。外部 kernel 需进图时转 `optimize-kernel-replacement`（K6 `custom_op`） | [16 模型总索引](turbophysai-compile-evidence.md) |
 
 **最小验证**：输出及适用的 loss/梯度/状态满足项目要求；日志和代表性 Trace 确认预期路径并解释剩余断图/重编译；正式测速关闭 Profiler、诊断日志和额外数值检查，比较首次调用、稳态耗时/吞吐及峰值显存。Profiler 不证明数值一致，日志减少不证明加速。失败或无收益时按 [诊断与停止规范](validation.md#诊断与停止条件) 定位、暂缓或按已约定策略回退，复测受任务预算约束，不无限扩大修改。
 
@@ -115,6 +118,7 @@
 | Cosmos3 | 关闭替换可能恢复基线已有 AOT；整个 Group 组合还改变布局 | [失败与关闭](cosmos3-compile-case-study.md#失败与关闭路径) |
 | OpenWAM | 从已安装 Group 汇总并冻结配置；大块与小函数开关独立，关闭不撤销已有包装 | [配置与消融](openwam-compile-case-study.md#配置冻结初始化与消融) |
 | 共享 engine（`engine/checking/checker.py`、`engine/__init__.py`） | 每个替换目标做 `source.identity` 检查：对原函数算 source_hash 与 ast_hash，对照配置 trust 里的 `source_hashes`/`ast_hashes`，命中任一为通过，无信任值为不适用，取不到为未知，不符为失败；可用 `force_groups` 越过可覆盖项。BEVFormer、BEVFusion、Cosmos3、OpenWAM、OpenVLA 的配置含这些字段；MapTRv2 在 `bc8ced4` 的目录里没有。Group 声明为原子单元，被阻止或回滚的 Group 连同依赖项一并隔离，其余 Group 继续；每个进程只允许应用一次，回滚失败是终止错误 | [包装式接入](decisions.md) |
+| PointPillars / LingBot-VLA-V2 | PointPillars 用 `with torch._dynamo.config.patch(optimize_ddp=False):` 将配置限定在训练循环上下文内；LingBot-VLA-V2 在 HIP 下包装 `triton_heuristics` 前插大 tile/reduction 候选并去重（全局 Inductor 调优，需同时验收编译耗时与稳态收益） | [16 模型总索引](turbophysai-compile-evidence.md) |
 
 **最小验证**：首次关闭/开启、已启用后关闭、重复入口、mode 改变和异常分别检查。原实现、重构后 eager、相同重构后 compiled 三组用于混合改动归因；给出真实启停命令，不暗示自动回退。
 
@@ -152,5 +156,6 @@
 | OpenVLA | 对匹配的 FSDP1 层分别包装，不能据此认定跨层共享同一个 callable 或图 | [粒度](openvla-compile-case-study.md#编译参数与粒度) |
 | MapTRv2 包装案例 | helper 按名称/mode 缓存，关注全局活动配置与复用隔离，和共享重复层不是同一缓存机制 | [缓存](maptrv2-turbophysai-compile-case-study.md#helper-缓存与活动-mode) |
 | MapTRv2 历史案例 | 父子入口同时 compile 时需检查实际捕获与融合；不假设每个装饰器独立生成图 | [入口与风险](maptrv2-case-study.md#19-个编译入口与-2-个-eager-边界) |
+| OpenPI | 针对嵌套 checkpoint 区域函数，通过闭包定位 owner 模型并按 `(function.__code__, mode, direct)` 缓存编译产物，避免每步重复创建编译包装 | [16 模型总索引](turbophysai-compile-evidence.md) |
 
 **最小验证**：同一对象/多对象、多层类型、不同形状、外层编译开关及缓存生命周期分别检查；记录包装创建次数、图/重编译证据、正确性和内存，不能互相替代。涉及 checkpoint 的状态和梯度验证归入 [P2](#p2) 与 [验证规范](validation.md)，不借此展开独立 checkpoint 调优。

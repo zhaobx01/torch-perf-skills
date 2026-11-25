@@ -47,9 +47,9 @@ prof = profile(
 
 rank 0 的 `prof.key_averages().table(sort_by="self_cuda_time_total")` 输出,或包含它的训练日志。只作 top 算子交叉校验;它是活跃窗口内的累计值,不含时间线。
 
-## 5. HTA 输出(可选)
+## 5. HTA 输出 / 已有 HTA 环境（可选）
 
-已有的 `temporal-*.csv`、`idle-*.csv`、`overlap-*.csv` 所在目录。本 Skill 不运行 HTA。
+已有的 `temporal-*.csv`、`idle-*.csv`、`overlap-*.csv` 所在目录可直接传 `--hta-dir`；若未提供 CSV 但用户已有安装好的 HTA Python 环境，可按 [hta-analysis.md](hta-analysis.md) 仅做只读交叉核对（绝不自动安装或升级 HTA）。
 
 ## 6. 缺数据时怎么办
 

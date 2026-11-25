@@ -1,66 +1,55 @@
-# TurboPhysAI channels-last 源码机制
+# TurboPhysAI 16 模型 Channels-Last 跨模型证据
 
-静态读源码所得，路径均相对 `turbo_physai/optimizations/`（除非另写）。没有运行模型，没有性能、精度数据；"未验证"表示原因或效果来自注释或推断。各模型实现独立，不能互相套用。固定提交：
+- **来源仓库与聚合分支**：[`zhaobx01/TurboPhysAI`](https://github.com/zhaobx01/TurboPhysAI) 分支 `corpus/all-models`（聚合 `HYGON-AI/TurboPhysAI` 官方 `main` `1eb24269da` + 13 个 Open PR）
+- **固定快照 SHA**：`796d3f6bce998d91af9d336f506a769b2bdde927`（下文所有源码链接均锁定到此提交，防止分支漂移）
+- **覆盖范围**：16 个模型中的 9 个含 channels-last 代码实现（MapTRv2、BEVFormer、BEVFusion、Sparse4D、LeRobot-ACT、DreamZero、OpenWAM、LingBot-VLA-V2、Cosmos3）及 1 个负例对照（OpenVLA）
+- **静态核实边界**：本文全部来自静态读源码对照，**未运行模型，无实测性能、显存或精度数据**。源码注释或文档中的原因/效果说明一律标为 **「来源自述，未复测」**；仅读 After、未逐行核实对应 Before 基线的条目显式标为 **「实现参考，基线待核实」**。离线无法打开外链时，[SKILL.md](../SKILL.md)、[patterns.md](patterns.md) 与 [validation.md](validation.md) 仍完整独立可用。
 
-- MapTRv2：[zhaobx01/TurboPhysAI](https://github.com/zhaobx01/TurboPhysAI/tree/bc8ced4a4b55e106579502edcb00b47b124f3fe4) `bc8ced4`，目录 `models/maptrv2_optimization/`。
-- BEVFormer、BEVFusion、Cosmos3：[iMountTai/TurboPhysAI main](https://github.com/iMountTai/TurboPhysAI/tree/bb302a6363a06582e303f052c743469c55af65bf) `bb302a6`。
-- OpenWAM：[iMountTai/TurboPhysAI feat/openwam](https://github.com/iMountTai/TurboPhysAI/tree/e4528c392096d2ad490e716af6f39ee3603af103) `e4528c3`。
-- OpenVLA：[xgbah/TurboPhysAI feat/openvla-optimization](https://github.com/xgbah/TurboPhysAI/tree/e7aaad0202cf2fb7ccf8082765bfba2057e00517) `e7aaad0`。
+---
 
-## MapTRv2
+## 一、案例元数据索引
 
-- 开关：`TURBO_PHYSAI_CHANNELS_LAST`（`configs/runtime.yaml:36` 设为 "1"，`training.py:121-122` 读取，代码默认 True）；作用域 `TURBO_PHYSAI_CHANNELS_LAST_SCOPE`，取 `model` 或 `backbone`，`runtime.yaml:37` 设为 `model`，其他值抛 ValueError（`training.py:42-51`）。
-- `model` 作用域对整个模型做 `model.to(channels_last)`，会触及所有 4D 参数；`backbone` 作用域只转 `img_backbone`（`training.py:54-62`）。
-- 输入边界：给 `img_backbone` 装 `forward_pre_hook`，仅当第一个输入为 4D 且尚非 channels_last 时调用 `contiguous`（`training.py:71-85`）。模型没有 `img_backbone` 时整段静默跳过（`:123`）。转换发生在 `original(...)` 之前（`:133`），DDP 包装的具体位置未核实。
-- ROCm：`PYTORCH_MIOPEN_SUGGEST_NHWC=1`（`runtime.yaml:13`）、`MIOPEN_FIND_MODE=1`（`:17`）、`TORCHINDUCTOR_LAYOUT_OPTIMIZATION=1`（`:29`）。
-- 算子约定：DCN 按输入是否 channels_last 选 memory_format，并把 input/offset/mask/weight 对齐到同一格式，反向同理（`turbo_physai/operators/modulated_deform_conv.py:220-238,276-299,463-466`）。GridSampler 仅当 input、output（反向为 grad_output、grad_input）全为 ChannelsLast 才走 NHWC kernel（仓库根 `kernel/grid_sample/GridSampler.cu:615-616,703-705`）。两者在训练中是否实际命中未核实。
-- 命名陷阱：`bev_pool_fix.py` 中的 `channels_last` 指 BEV 池化输出的轴排列（`[B,Z,H,W,C]`），不是 torch memory_format。
-- `TransposeImage`：`note.md:79` 描述为把输入转成 channels_last 的 pipeline；`README.md:171-173` 称 grep 只命中定义处、没有 config 引用，是未接线的实验代码（我只读了 README 的说法，没有自行全仓库搜索）。
+| 机制分组 | 模型 | 证据状态 | Before 基线 SHA | After 固定链接 (`796d3f6`) | 原始 PR | 关键符号 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2D Backbone / 可配置作用域 | MapTRv2 / BEVFormer / BEVFusion / Sparse4D | 已核实改造案例 | `e03f097abe` / `66b65f3a1f` / `326653dc06` / `249ffbb695` | [maptrv2/training.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/maptrv2/training.py)、[bevformer/backbone.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevformer/backbone.py)、[bevfusion/training.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevfusion/training.py)、[sparse4d/channels_last.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/sparse4d/channels_last.py) | `#45` / `main` / `#43` | `_convert_to_channels_last`、`_install_input_layout_hook`、`_convert_conv2d_weights_to_channels_last`、`extract_feat` |
+| 首层标记 + 优化器状态连续化 | LeRobot-ACT | 已核实改造案例 | `3f2179f3b6` | [lerobot_act/channels_last.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/lerobot_act/channels_last.py)、[lerobot_act/catalog.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/lerobot_act/catalog.py) | `#44` | `channels_last_init_wrapper`、`channels_last_input_wrapper`、`contiguous_optimizer_state_wrapper` |
+| 3D Conv 前反向非对称布局 | LingBot-VLA-V2 | 已核实改造案例 | `47b0e478f3` (transformers) | [lingbot_vla_v2/conv3d_channel_last.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/lingbot_vla_v2/conv3d_channel_last.py) | `#40` | `_ChannelLastConv3d`、`torch.nn.grad.conv3d_weight` |
+| 5D/4D 混合 VAE + DiT Patch Embed | DreamZero | 已核实改造案例 | `ab790c198f` | [dreamzero/wan_video_vae.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/dreamzero/wan_video_vae.py)、[dreamzero/CausalWanModel.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/dreamzero/CausalWanModel.py) | `#42` | `init_channels_last`、`resample_forward`、`attention_block_forward`、`init_weights` |
+| 5D VAE 编译态布局保持与图复用 | OpenWAM | 已核实改造案例 | `0c9ed80d80` | [openwam/__init__.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/__init__.py)、[openwam/vae_layout.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/vae_layout.py)、[openwam/ports/vae.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/ports/vae.py)、[openwam/pointwise.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/pointwise.py) | `#27` | `convert_conv3d_weight_memory_format`、`force_stride_order`、`_clone_cache`、`vae_normalize` |
+| 融合 3D 卷积与时序缓存契约 | Cosmos3 | 实现参考，基线待核实 | `9726697a83` | [cosmos-framework.patch](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/model_examples/Cosmos3/cosmos-framework.patch) | `#19` | `apply_channels_last_conv_weights`、`fused_conv3d_bias_ndhwc` |
+| 算子布局契约与命名陷阱对照 | MapTRv2 / BEVFormer / BEVFusion | 已核实改造案例 | `e03f097abe` / `66b65f3a1f` / `326653dc06` | [operators/modulated_deform_conv.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/operators/modulated_deform_conv.py)、[kernel/grid_sample/GridSampler.cu](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/kernel/grid_sample/GridSampler.cu)、[maptrv2/bev_pool_fix.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/maptrv2/bev_pool_fix.py)、[bevfusion/depth.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevfusion/depth.py) | `main` / `#45` | `modulated_deform_conv2d`、`GridSampler`、逻辑 NHWC 命名反例 |
+| 无转换负例对照 | OpenVLA | 已核实改造案例 | `c8f03f48af` | [openvla/vision_timm.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openvla/vision_timm.py) | `main` | 仅改写 `patch_embed` 避 Dynamo 问题，未设 channels-last |
 
-## BEVFormer
+---
 
-- 输入：扁平化后的 `(B*cams,C,H,W)` 图像在 grid_mask 之后、`img_backbone` 之前无条件 `to(channels_last)`，没有开关（`models/bevformer/backbone.py:39`）。整段 `compiled_extract_img_feat` 被编译时，这个转换落在编译区域内；`TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 返回 eager 函数（`backbone.py:73-80`）。neck 输出不转换。
-- 整模型：runtime_hcu 路径无条件 `model.to(channels_last)`（`training.py:242`），与输入转换是两个独立机制；是否触及非卷积 4D 参数未验证。
-- 算子：hipDNN 可变形卷积 forward 返回 NHWC buffer 的 `.permute(0,3,1,2)` 视图（`mdc.py:325`，fake 实现 `:504`），wrw 中强制 `grad_output` 为 channels_last（`:342`）。`msda.py:90` 只检查 `grad_output.is_contiguous()`。
-- ROCm：`PYTORCH_MIOPEN_SUGGEST_NHWC=1`（`configs/runtime.yaml:15`）、`MIOPEN_FIND_MODE=1`（`:16`）；没有设 `TORCHINDUCTOR_LAYOUT_OPTIMIZATION`。
+## 二、按机制精选代表要点
 
-## BEVFusion
+### 1. 2D 视觉 Backbone 转换作用域与入口边界（MapTRv2 / BEVFormer / BEVFusion / Sparse4D）
+- **可配置作用域 + `forward_pre_hook`**：[maptrv2/training.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/maptrv2/training.py) 提供 `channels_last_scope in {"model", "backbone"}`（非法值抛 `ValueError`），对 `img_backbone` 注册 `forward_pre_hook` 仅在首输入为 4D 且非 channels-last 时转换；无 `img_backbone` 时静默跳过。
+- **仅转 Conv2d 权重 vs 整模型转换**：[bevfusion/training.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevfusion/training.py) 只转 `Conv2d` 权重（`Conv3d` 与 sparse conv 不转），输入在 [bevfusion/backbone.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevfusion/backbone.py) `view(B*cams, ...)` 后转，且转换位于编译区外；[bevformer/backbone.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevformer/backbone.py) 与 [bevformer/training.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevformer/training.py) 则存在入口 `to(channels_last)`（在编译区内）和整模型转换两处独立机制。
+- **相机展平后转 + 下游特征打包边界**：[sparse4d/channels_last.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/sparse4d/channels_last.py) 仅转 `self.img_backbone`，在 5D 多视角 `flatten(end_dim=1)` 及 `grid_mask` 后执行 `img.to(memory_format=torch.channels_last)`，并缓存多尺度特征打包元数据 `(spatial_shape, scale_start_index)`。
 
-- 输入：先 `view(B*cams,...)`，再由 `MMDET3D_CHANNELS_LAST` 决定是否 `contiguous(channels_last)`（`models/bevfusion/backbone.py:51-52`）；`_env_flag` 未设置时为 False，`runtime.yaml:11` 设为 "1"。
-- 权重：`_convert_conv2d_weights_to_channels_last` 只转 Conv2d，用 `weight.data = weight.data.contiguous(...)` 原地替换（`training.py:455-466`）；开关 `options.channels_last` 或 `MMDET3D_CHANNELS_LAST`，默认 True（`training.py:505`，`recipe.yaml:27`，`optimization.yaml:119`）。Conv3d 与 sparse conv 不转；与优化器、DDP 的顺序未核实。
-- 编译边界：只编译 camera backbone，`fullgraph=False, dynamic=False`（`training.py:473-487`），输入转换在编译区域之外。
-- ROCm：`PYTORCH_MIOPEN_SUGGEST_NHWC=1`（`runtime.yaml:10`）、`TORCHINDUCTOR_LAYOUT_OPTIMIZATION=1`（`:14`）。
-- 命名陷阱：`depth.py:191` 的 `permute(0,2,3,1).contiguous()` 是为 BEV pooling 准备的逻辑 NHWC，不是 memory_format；`bev_pool` 的布局契约未读。
+### 2. 首层精确标记与优化器状态连续化（LeRobot-ACT）
+- [lerobot_act/channels_last.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/lerobot_act/channels_last.py) 只转换 `self.backbone` 与 `self.encoder_img_feat_input_proj`，并仅给 `backbone` 内首个 `nn.Conv2d` 打 `_CONV_MARKER` 标记，包装 `Conv2d.forward` 时只对带标记层转输入（不波及模型其他卷积）。
+- **Checkpoint 关键坑位**：[lerobot_act/catalog.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/lerobot_act/catalog.py) 包装 `lerobot.optim.optimizers._save_single_optimizer_state`，在保存前递归调用 `_contiguous_tensors` 将优化器 state 张量全部转为 `.contiguous()`，避免 channels-last 参数衍生的非连续优化器状态影响 checkpoint 兼容。
 
-## Cosmos3
+### 3. 3D 卷积前反向非对称布局（LingBot-VLA-V2）
+- 基线 `transformers` 的 `Qwen3VLVisionPatchEmbed.forward` 直接调用 `self.proj(...)`（5D `Conv3d`）。
+- [lingbot_vla_v2/conv3d_channel_last.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/lingbot_vla_v2/conv3d_channel_last.py) 用自定义 `autograd.Function`（`_ChannelLastConv3d`）拆分前反向：前向用 `@torch.compiler.disable` 调 `F.conv3d(..., channels_last_3d)`；反向检查 `if ctx.needs_input_grad[0]: raise RuntimeError(...)`，并用 `torch.nn.grad.conv3d_weight(hidden_states.contiguous(), weight.shape, grad_output.contiguous(), stride=...)` 在连续 NCDHW 上计算权重梯度。
 
-- 总开关：`training_channels_last_enabled()` 在 HIP 构建上自动为真（`common/pytorch/memory_format.py:21`），`vae/layout.py:43` 据此得到 `_USE_CHANNELS_LAST`，没有单独的用户开关。融合 HCU causal Conv3d 需 `COSMOS_WAN_VAE_CLEAN_FUSED_OP=1`，默认关（`vae/fused_ops/_hipdnn.py:47-51`）。
-- 权重：生成器的 Conv2d/Conv3d 权重由 `apply_channels_last_conv_weights(net)` 转换（`omni_model.py:80`），分别对应 channels_last 与 channels_last_3d；调用早于 FSDP 包装的说法来自调用点上下文，包装顺序未逐行核实。VAE 在 `__init__` 中对 Conv2d/Conv3d 模块分别 `module.to(memory_format=...)`（`vae/wan_vae.py:44-49`）。
-- 激活：分块时 `x_chunk.contiguous(channels_last_3d)`（`wan_vae.py:241-242`）；`vae/layout.py` 提供 `_to_channels_last_2d/3d` 与 `_is_layout_contiguous`（`:46-58`）。Qwen 视觉 patch-embed 在 5D 输入进入 Conv3d 前调用 `to_channels_last`（`qwen.py:91,105`）。
-- 融合算子契约：规范 NDHWC stride 为 `[C*T*H*W, 1, H*W*C, W*C, C]`（`_hipdnn.py:179-182`）。`fused_conv3d_bias_ndhwc`（`conv_bias.py:264`）要求 x、weight 均 `is_contiguous(channels_last_3d)`（`:282-283`）；另一个融合算子是 `fused_causal_cache_pad_conv3d_ndhwc`（`concat_conv_bias.py:344`）。其他条件来自源码：bf16、通道数在 {160,320,640} 且为 16 的倍数、不带 requires_grad。不满足时回退 `F.conv3d`，输入为 channels_last_3d 则输出也转回该格式（`conv_bias.py:132-133`）。
-- 输入通道 12 的 stem 层被明确排除，源注释称为避免 hipDNN 选到退化 tile（`_hipdnn.py:160-176`，原因未验证）。
-- 注册：`torch.library.custom_op` 加 `register_fake`，torch 低于 2.4 时用桩（`_hipdnn.py:69-82`）。
-- AOT：`interface_compile_encode`（`wan_vae.py:327`）导出分块编码，按变体编译，分块与缓存在导出路径中用 `assert _is_layout_contiguous(...)` 保持 NDHWC（`:122-128`）。
-- ROCm：`PYTORCH_MIOPEN_SUGGEST_NDHWC=1`、`MIOPEN_FIND_MODE=1`（`configs/runtime.yaml:11-12`）；没有设 `TORCHINDUCTOR_LAYOUT_OPTIMIZATION`。
+### 4. 5D/4D 混合视频 VAE、缓存一致性与编译态布局保持（DreamZero / OpenWAM / Cosmos3）
+- **混合 3D/2D VAE 分维转换**：[dreamzero/wan_video_vae.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/dreamzero/wan_video_vae.py) 在 `__init__` 对 `Conv3d`/`ConvTranspose3d` 转 `channels_last_3d`、对 `Conv2d` 转 `channels_last`；在 `Resample` 与 `AttentionBlock` 执行 `rearrange(x, 'b c t h w -> (b t) c h w')` 后显式 `contiguous(memory_format=torch.channels_last)`；[dreamzero/CausalWanModel.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/dreamzero/CausalWanModel.py) 在 `init_weights` 单独将 `self.patch_embedding`（3D 卷积）转 `channels_last_3d`。
+- **编译态 `force_stride_order`、缓存同格式与单元维图复用**：[openwam/settings.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/settings.py)（`vae_channels_last` 默认关）、[openwam/__init__.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/__init__.py) 在 DeepSpeed 前调用 `convert_conv3d/2d_weight_memory_format`；[openwam/ports/vae.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/ports/vae.py) 用 `clone(memory_format=torch.channels_last_3d)` 保持 `feat_cache` 同格式；[openwam/vae_layout.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/vae_layout.py) 编译态调私有 `force_stride_order`（注释「来源自述，未复测」称单靠 `contiguous` 可能在融合图中消失）；[openwam/pointwise.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/pointwise.py) 对单元维用 `as_strided` 统一等价 stride 复用图。
+- **融合 3D 卷积契约（Cosmos3，实现参考，基线待核实）**：[cosmos-framework.patch](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/model_examples/Cosmos3/cosmos-framework.patch) 中 `fused_conv3d_bias_ndhwc` 要求输入/权重/缓存均 `is_contiguous(channels_last_3d)`、bf16、通道白名单 `{160,320,640}`、无梯度，排除 12 通道 stem 层（注释「来源自述，未复测」称避免 hipDNN 退化 tile），不满足回退 `F.conv3d` 并恢复输出为 `channels_last_3d`；缓存 `clone(memory_format=torch.channels_last_3d)` 确保 `N=1`/`T=1` 不丢格式。
 
-## OpenWAM
+### 5. 自定义算子契约与常见命名陷阱
+- **算子全张量同格式要求**：[operators/modulated_deform_conv.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/operators/modulated_deform_conv.py) 对齐 `input`/`offset`/`mask`/`weight` 格式；[kernel/grid_sample/GridSampler.cu](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/kernel/grid_sample/GridSampler.cu) 仅当 input 与 output（反向为 grad）全为 `ChannelsLast` 才走 NHWC kernel；[bevformer/mdc.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevformer/mdc.py) 的 hipDNN DCN 返回 NHWC buffer 的 `.permute(0,3,1,2)` 视图且 wrw 强制 `grad_output` 为 channels-last。
+- **逻辑轴排列命名陷阱**：[maptrv2/bev_pool_fix.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/maptrv2/bev_pool_fix.py) 的 `channels_last` 指 BEV 池化轴排列 `[B,Z,H,W,C]`，[bevfusion/depth.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/bevfusion/depth.py) 的 `permute(0,2,3,1).contiguous()` 是逻辑 NHWC，均**不是** `torch.channels_last` memory format。
+- **ROCm 布局变量覆盖**：16 模型中有 13 个模型的 `runtime.yaml` 含 `PYTORCH_MIOPEN_SUGGEST_NHWC=1` 或 `PYTORCH_MIOPEN_SUGGEST_NDHWC=1`（另在 [openwam/launch.py](https://github.com/zhaobx01/TurboPhysAI/blob/796d3f6bce998d91af9d336f506a769b2bdde927/turbo_physai/optimizations/models/openwam/launch.py) 以 `setdefault` 设置）；上游 PyTorch 2.10 `ATen/native/ConvUtils.h` 仅读取 `PYTORCH_MIOPEN_SUGGEST_NHWC` 并同时服务 4D/5D，厂商分支行为需按实际安装版本核实。
 
-- 开关：`vae_channels_last`，默认 True（`models/openwam/settings.py:53`，`configs/optimization.yaml:145`）；`vae_pointwise_compile`、`compile_vae` 默认关，编译仅在 `global_compile` 范围含 vae 时进入。
-- 权重：`prepare_model` 调用 `torch.nn.utils.convert_conv3d_weight_memory_format(vae, channels_last_3d)` 和 Conv2d 版本（`__init__.py:76-77`），在 DeepSpeed 之前一次性完成。
-- 激活：`ports/vae.py` 的 `_layout`（`:16-22`）5D 走 `vae_layout.channels_last`，4D 走 `contiguous(channels_last)`；边界覆盖 `CausalConv3d_forward`（`:32`）、`Resample_forward` 中 5D 与 4D 间的 `rearrange`（`:98-100`）、`ResidualBlock_forward`（`:116` 起）及 VAE 编码输入。
-- 缓存：`_clone_cache` 把 feat_cache 条目 clone 为 `channels_last_3d`（`ports/vae.py:26-28`），缓存与激活同格式。
-- 编译：`vae_layout.py:30-35` eager 用 `contiguous`，编译中用私有 `torch._inductor.inductor_prims.force_stride_order(x, [c*t*h*w, 1, h*w*c, w*c, c])`；docstring 称 `contiguous` 可能在融合图中消失（推断，未运行）。`launch.py:21` 的 `vae_layout.validate()` 在 `force_stride_order` 缺失时抛错。
-- 图复用：`pointwise.py:85-93` 对 channels_last_3d 的 5D 张量用 `as_strided` 统一单元维的等价 stride，以共享编译图，随后 `mark_static`。
-- ROCm：`MIOPEN_FIND_MODE=1`、NHWC、NDHWC 提示（`configs/runtime.yaml:9-11`，`runtime.optimized.yaml:11-13`）；没有设 `TORCHINDUCTOR_LAYOUT_OPTIMIZATION`。
+---
 
-## OpenVLA
+## 三、已搜但未发现与显式排除项
 
-在 `models/openvla/` 中搜索 `channels.?last|nhwc|memory_format|layout|permute\(|Conv2d|patch_embed`，只命中 `vision_timm.py:73` 的 `self.patch_embed(x)`，它是为避开 Dynamo 问题而改写，不是布局转换。`configs/runtime.yaml:14` 仅设 `MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32`。结论限于该提交与目录，不代表其他分支。
-
-## 未检查
-
-- 这些路径是否在实际训练或推理中命中，包括 DCN、GridSampler、`bev_pool`、spconv 的布局契约。
-- AMP 与 channels-last 的交互（所读文件里没有相关代码）；FSDP/DeepSpeed 与权重转换的先后顺序仅按调用点推断。
-- MapTRv2 assigner 的 cudagraphs 与 channels-last 是否冲突；仓库内说明与配置并不一致，未运行核实。
-- 各远端分支今天的 HEAD 是否仍等于上述提交；部分克隆为浅克隆。
-- 所有性能、显存、精度结论。
+- **已搜但未发现（基于本次快照）**：`OpenVLA`、`GR00T`、`OpenPI`、`DiT4DiT`、`LingBot-VA`、`FlashOCC`、`PointPillars` 中未发现显式 `torch.channels_last` / `channels_last_3d` 代码转换（部分模型的 `runtime.yaml` 仅写了 `PYTORCH_MIOPEN_SUGGEST_NHWC=1`，不代表张量已转换）；全仓未核实 AMP 与 channels-last 交互的专门补丁，也未实测任何自定义算子在训练中是否实际命中 NHWC 分支。
+- **本 Skill 显式排除项（归属邻近领域）**：各模型 `runtime.yaml` 中的 `MIOPEN_FIND_MODE=1`（算法搜索策略，交运行时/后端调优侧）与 `TORCHINDUCTOR_LAYOUT_OPTIMIZATION=1`（Inductor 全局布局开关，交 `torch-compile-integration`），在本 Skill 中仅作消融隔离提示。
