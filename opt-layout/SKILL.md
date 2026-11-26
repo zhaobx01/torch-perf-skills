@@ -1,6 +1,8 @@
 ---
 name: opt-layout
 description: Analyze or implement PyTorch channels_last and channels_last_3d memory layouts for convolutional subgraphs on CUDA or ROCm/HIP. Use for convolution hotspots, repeated layout conversions, or debugging layout propagation. Hand off global compilation and recompilation to opt-compile, and kernel selection to opt-kernel.
+metadata:
+  version: "1.0.0"
 ---
 
 # Optimize Channels-Last

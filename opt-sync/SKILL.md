@@ -5,6 +5,8 @@ description: >-
   gaps around D2H reads or suspected hot-path scalar/dynamic-shape stalls. Route
   batch H2D to opt-dataloader, capture faults to opt-compile,
   and exposed collectives to opt-distributed.
+metadata:
+  version: "1.0.0"
 ---
 
 # Optimize Sync Elimination

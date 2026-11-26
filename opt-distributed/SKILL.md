@@ -1,6 +1,8 @@
 ---
 name: opt-distributed
 description: Analyze or implement PyTorch multi-GPU collective overlap, sharding, and RCCL ordering. Use for exposed collectives, wrapper/config review, or RCCL ordering failures. Triage slow ranks first. Route batch/H2D stalls to opt-dataloader, step-internal sync to opt-sync, and graph capture to opt-compile.
+metadata:
+  version: "1.0.0"
 ---
 
 # Optimize Distributed Comm

@@ -5,6 +5,8 @@ description: >-
   Use for a hot operator, an unfused optimizer, or attention backend selection and fallback.
   Route compile scope and global Inductor tuning to opt-compile,
   layout propagation to opt-layout, and host-device stalls to opt-sync.
+metadata:
+  version: "1.0.0"
 ---
 
 # Optimize Kernel Replacement

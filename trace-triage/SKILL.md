@@ -1,6 +1,8 @@
 ---
 name: trace-triage
 description: Upstream read-only bottleneck profiler for PyTorch training/inference. Parses multi-rank PyTorch Profiler traces plus optional run records, compile logs, key_averages, and HTA outputs (or optionally runs HTA in an existing Python environment for cross-checking) to quantify GPU time breakdown, idle attribution, sync starvation, H2D/D2H transfers, exposed communication, and a Top-5 recoverable upper-bound ranking, then hands off to downstream optimization skills. Use whenever you have Profiler traces and want to find where GPU time goes or which optimization direction to prioritize; when traces are missing, output the collection checklist only. Do not use to edit project source code, run training/profiling, or design concrete compile/kernel/layout/sync rewrites (hand off to opt-compile, opt-kernel, opt-layout, or opt-sync).
+metadata:
+  version: "1.0.0"
 ---
 
 # Trace 瓶颈速览（上游只读诊断入口）

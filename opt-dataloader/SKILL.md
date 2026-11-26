@@ -7,6 +7,8 @@ description: >-
   Route step-internal D2H synchronization to opt-sync,
   collective overlap to opt-distributed, and compile shape
   contracts to opt-compile.
+metadata:
+  version: "1.0.0"
 ---
 
 # Optimize Data Pipeline

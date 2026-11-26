@@ -7,6 +7,8 @@ description: >-
   allocator activity. Route offline feature caches to opt-dataloader,
   graph capture to opt-compile, and collective overlap to
   opt-distributed.
+metadata:
+  version: "1.0.0"
 ---
 
 # Optimize Memory And Recompute

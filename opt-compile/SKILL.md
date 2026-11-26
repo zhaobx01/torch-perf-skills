@@ -9,7 +9,7 @@ description: >-
   conv layouts to opt-layout, and host-device stalls to
   opt-sync.
 metadata:
-  version: "2.2.0"
+  version: "1.0.0"
 ---
 
 # Torch Compile Integration
