@@ -10,16 +10,16 @@ Detected patterns (all name/AST-based, so false positives are expected):
   adamw_not_fused          torch.optim.AdamW(...) / AdamW(...) without fused=/foreach=
   non_adamw_optimizer      Muon / DistributedMuon / batched_newton_schulz (batched/multi-tensor candidates)
   flex_attention_call      flex_attention / create_block_mask / create_mask (tile, H=1 mask, TF32+cache_key_tag)
-  fa2_varlen_call          flash_attn_varlen*_func (check dense flash_attn_func fast path for uniform batches)
+  fa2_varlen_call          known FA2 varlen APIs, including the masked vendor API
   sdpa_call                F.scaled_dot_product_attention(...) (check backend choice & backward finiteness)
-  mha_default_avg_weights  nn.MultiheadAttention / multi_head_attention_forward without average_attn_weights=False
+  mha_default_avg_weights  MHA constructor as a call-site clue, or functional MHA without weights opt-outs
   manual_attention         softmax(q @ k.T ...) style attention written by hand
-  complex_rope             view_as_complex / view_as_real / torch.polar (complex/polar RoPE)
+  complex_rope             view_as_complex / torch.polar / view_as_real of a rotary-like product
   layernorm_module         nn.LayerNorm / nn.RMSNorm construction (vendor kernel / compile candidates)
-  norm_then_add            a norm call whose result is added to another value in one expression
+  add_then_norm            a norm call whose input is an addition expression: norm(x + residual)
   upsample_bilinear        nn.Upsample / F.interpolate with mode="bilinear" (check Inductor gather lowering)
   custom_autograd          torch.autograd.Function subclass (check torch.compile traceability)
-  custom_op_missing_fake   torch.library.custom_op without matching register_fake in the same file
+  custom_op_missing_fake   custom_op without a statically matched register_fake in the same file
 
 Usage:
     python3 scan_kernel_candidates.py <file-or-dir> [...]
@@ -27,16 +27,32 @@ Usage:
     python3 scan_kernel_candidates.py --patterns flex_attention_call,complex_rope <file-or-dir>
 
 Only the Python standard library is used (Python 3.6+ compatible).
+Use a Python interpreter that supports the scanned source's syntax. Dynamic
+arguments and cross-file registrations require manual review. JSON output
+includes `disclaimer`, `files_scanned`, `files_skipped`, `skipped_files`, and
+`findings`. Exit 1 indicates a partial or empty scan, and exit 2 indicates
+invalid CLI arguments.
 """
 
 import argparse
 import ast
 import json
 import os
+import re
 import sys
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+import tokenize
+from typing import Dict, List, Optional, Set, Tuple
 
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache"}
+_FA2_VARLEN_CALLS = {
+    "flash_attn_varlen_func", "flash_attn_varlen_qkvpacked_func",
+    "flash_attn_varlen_with_mask_func",
+}
+_NORM_CALL_RE = re.compile(r"(?:(?:\w+_)?norm|layernorm|rmsnorm|layer_norm|rms_norm)\d*")
+_DISCLAIMER = (
+    "STATIC candidates only: they do not show the code is slow, that a replacement "
+    "exists for your platform, or that it is numerically equivalent. Confirm with a profiler first."
+)
 
 _NOTES = {
     "adamw_not_fused": (
@@ -52,16 +68,16 @@ _NOTES = {
         "create_mask + expand), forward/backward kernel_options tile tuning, and FP32 TF32 + cache_key_tag."
     ),
     "fa2_varlen_call": (
-        "FlashAttention varlen call; if uniform batches occur (q_lens/k_lens is None), evaluate "
-        "routing to dense flash_attn_func. Guard any private FA2 internals with version/hash checks."
+        "FlashAttention varlen call. Evaluate dense routing only if the input lengths and "
+        "mask contract permit it. Guard private APIs with version or hash checks."
     ),
     "sdpa_call": (
         "scaled_dot_product_attention call; confirm which backend is selected on the target "
         "platform and that backward gradients are finite (avoid mistaking MATH fallback for speedup)."
     ),
     "mha_default_avg_weights": (
-        "MultiheadAttention / multi_head_attention_forward without average_attn_weights=False; "
-        "check if callers actually consume averaged weights and whether FP32 QK matmul is hot."
+        "Functional MHA without an explicit weights opt-out; check whether callers consume "
+        "averaged weights and whether FP32 QK matmul is hot."
     ),
     "manual_attention": (
         "Attention written by hand (softmax of a matmul); a fused attention backend may apply "
@@ -75,9 +91,9 @@ _NOTES = {
         "Norm module construction; a vendor fused kernel or compiled tensor helper may apply "
         "for the target platform. Confirm a fallback path before replacing."
     ),
-    "norm_then_add": (
-        "A norm call is combined with an addition in one expression; a fused add+norm kernel "
-        "is a candidate only if the profiler shows this region is hot."
+    "add_then_norm": (
+        "Norm call takes an addition expression norm(x + residual); check whether residual output "
+        "is reused and whether a fused add+norm kernel applies on the target backend."
     ),
     "upsample_bilinear": (
         "Bilinear Upsample/interpolate; under torch.compile check whether Inductor lowers it to "
@@ -88,8 +104,8 @@ _NOTES = {
         "registration is needed, and whether native extensions have Python-level shape/dtype guards."
     ),
     "custom_op_missing_fake": (
-        "torch.library.custom_op used without a matching register_fake in this file; "
-        "torch.compile requires a fake implementation with matching shape, dtype, and device."
+        "No statically matched register_fake in this file. Check for dynamic or cross-file "
+        "registration and verify fake output metadata if this op is used under torch.compile."
     ),
 }
 
@@ -131,7 +147,7 @@ def _str_const(node):
     # type: (Optional[ast.AST]) -> Optional[str]
     if node is None:
         return None
-    if isinstance(node, ast.Str):
+    if hasattr(ast, "Str") and isinstance(node, ast.Str):
         return node.s
     if hasattr(ast, "Constant") and isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
@@ -151,19 +167,65 @@ def _bool_const(node):
 
 def _kw_map(node):
     # type: (ast.Call) -> Dict[str, ast.AST]
-    return {kw.arg: kw.value for kw in node.keywords if kw.arg}
+    result = {}
+    for kw in node.keywords:
+        if kw.arg is not None:
+            result[kw.arg] = kw.value
+        elif isinstance(kw.value, ast.Dict):
+            for key_node, value in zip(kw.value.keys, kw.value.values):
+                key = _str_const(key_node)
+                if key is not None:
+                    result[key] = value
+    return result
 
 
-def _is_custom_op_decorator(dec):
-    # type: (ast.AST) -> Tuple[bool, Optional[str]]
-    if isinstance(dec, ast.Call):
-        name = _dotted(dec.func)
-        if name.endswith("library.custom_op") or name == "custom_op":
-            op_name = _str_const(dec.args[0]) if dec.args else None
-            if op_name is None:
-                op_name = _str_const(_kw_map(dec).get("name"))
-            return True, op_name
-    return False, None
+def _call_argument(node, keywords, name, position):
+    # type: (ast.Call, Dict[str, ast.AST], str, int) -> Optional[ast.AST]
+    if name in keywords:
+        return keywords[name]
+    if len(node.args) > position and not any(
+        isinstance(arg, ast.Starred) for arg in node.args[:position + 1]
+    ):
+        return node.args[position]
+    return None
+
+
+def _library_call(resolved, symbol):
+    # type: (str, str) -> bool
+    return resolved in (symbol, "library." + symbol, "torch.library." + symbol)
+
+
+def _is_torch_nn_symbol(resolved, raw, is_imported, symbol):
+    # type: (str, str, Optional[bool], str) -> bool
+    if is_imported is True:
+        return resolved in (
+            "torch.nn." + symbol,
+            "torch.nn.modules.normalization." + symbol,
+            "torch.nn.modules.activation." + symbol,
+        )
+    if is_imported is False:
+        return False
+    return raw in (symbol, "nn." + symbol, "torch.nn." + symbol)
+
+
+def _is_torch_adamw(resolved, raw, is_imported):
+    # type: (str, str, Optional[bool]) -> bool
+    if is_imported is True:
+        return resolved in ("torch.optim.AdamW", "torch.optim.adamw.AdamW")
+    if is_imported is False:
+        return False
+    return raw in ("AdamW", "optim.AdamW", "torch.optim.AdamW")
+
+
+def _looks_like_rotary_product(node):
+    return (
+        isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult)
+        and any(
+            token in _dotted(part).lower()
+            for part in ast.walk(node) if isinstance(part, (ast.Name, ast.Attribute))
+            for token in ("freq", "rope", "rotary")
+        )
+    )
 
 
 class _Visitor(ast.NodeVisitor):
@@ -172,126 +234,234 @@ class _Visitor(ast.NodeVisitor):
         self.path = path
         self.lines = lines
         self.findings = []  # type: List[Finding]
-        # Track custom_op declarations: list of (lineno, fn_name, op_name)
-        self.custom_ops = []  # type: List[Tuple[int, Optional[str], Optional[str]]]
-        self.fake_fn_names = set()  # type: Set[str]
+        # Track custom_op declarations: list of (lineno, scope_id, fn_name, op_name)
+        self.custom_ops = []  # type: List[Tuple[int, int, Optional[str], Optional[str]]]
+        self.fake_fn_keys = set()  # type: Set[Tuple[int, str]]
         self.fake_op_names = set()  # type: Set[str]
-        self.has_generic_register_fake = False
-        self._in_custom_op_call_nodes = set()  # type: Set[int]
+        self.custom_op_bindings = {}  # type: Dict[int, Tuple[int, str]]
+        self._scopes = [{}]  # type: List[Dict[str, Optional[str]]]
+        self._scope_ids = [0]  # type: List[int]
+        self._next_scope_id = 1
 
-    def _emit(self, node, pattern):
-        # type: (ast.AST, str) -> None
+    def _emit(self, node, pattern, note=None):
+        # type: (ast.AST, str, Optional[str]) -> None
         line = getattr(node, "lineno", 0)
         snippet = self.lines[line - 1].strip() if 0 < line <= len(self.lines) else ""
-        self.findings.append(Finding(self.path, line, pattern, snippet, _NOTES[pattern]))
+        self.findings.append(Finding(self.path, line, pattern, snippet, note or _NOTES[pattern]))
 
-    def _record_register_fake_call(self, node):
-        # type: (ast.Call) -> None
-        func = node.func
-        name = _dotted(func)
-        if isinstance(func, ast.Attribute) and func.attr == "register_fake":
-            if isinstance(func.value, ast.Name):
-                self.fake_fn_names.add(func.value.id)
+    def _push_scope(self):
+        # type: () -> None
+        self._scopes.append({})
+        self._scope_ids.append(self._next_scope_id)
+        self._next_scope_id += 1
+
+    def _pop_scope(self):
+        # type: () -> None
+        self._scopes.pop()
+        self._scope_ids.pop()
+
+    def _resolve(self, node):
+        # type: (ast.AST) -> Tuple[str, Optional[bool]]
+        raw = _dotted(node)
+        if not raw:
+            return "", None
+        head, _, tail = raw.partition(".")
+        for scope in reversed(self._scopes):
+            if head in scope:
+                target = scope[head]
+                if isinstance(target, str):
+                    return ("{}.{}".format(target, tail) if tail else target), True
+                return raw, False
+        return raw, None
+
+    def _binding_scope(self, name):
+        # type: (str) -> int
+        for scope_id, scope in zip(reversed(self._scope_ids), reversed(self._scopes)):
+            if name in scope:
+                return scope_id
+        return self._scope_ids[-1]
+
+    def _bind_local(self, target):
+        # type: (ast.AST) -> None
+        if isinstance(target, ast.Name):
+            self._scopes[-1][target.id] = None
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._bind_local(elt)
+        elif isinstance(target, ast.Starred):
+            self._bind_local(target.value)
+
+    def visit_Import(self, node):
+        # type: (ast.Import) -> None
+        for alias in node.names:
+            head = alias.name.split(".")[0]
+            local = alias.asname or head
+            self._scopes[-1][local] = alias.name if alias.asname else head
+
+    def visit_ImportFrom(self, node):
+        # type: (ast.ImportFrom) -> None
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            local = alias.asname or alias.name
+            if node.level == 0 and node.module:
+                self._scopes[-1][local] = "{}.{}".format(node.module, alias.name)
             else:
-                op_name = _str_const(node.args[0]) if node.args else _str_const(_kw_map(node).get("qualname"))
-                if op_name:
-                    self.fake_op_names.add(op_name)
-                else:
-                    self.has_generic_register_fake = True
-        elif name == "register_fake":
-            op_name = _str_const(node.args[0]) if node.args else None
-            if op_name:
-                self.fake_op_names.add(op_name)
-            else:
-                self.has_generic_register_fake = True
+                self._scopes[-1][local] = None
 
     def visit_FunctionDef(self, node):
         # type: (ast.FunctionDef) -> None
+        enclosing_scope_id = self._scope_ids[-1]
+        self._scopes[-1][node.name] = None
         if node.name == "batched_newton_schulz":
             self._emit(node, "non_adamw_optimizer")
         for dec in node.decorator_list:
-            is_op, op_name = _is_custom_op_decorator(dec)
-            if is_op:
-                self.custom_ops.append((dec.lineno, node.name, op_name))
-                self._in_custom_op_call_nodes.add(id(dec))
+            if isinstance(dec, ast.Call):
+                dec_resolved, _ = self._resolve(dec.func)
+                if _library_call(dec_resolved, "custom_op"):
+                    self.custom_op_bindings[id(dec)] = (enclosing_scope_id, node.name)
             elif isinstance(dec, ast.Attribute) and dec.attr == "register_fake":
                 if isinstance(dec.value, ast.Name):
-                    self.fake_fn_names.add(dec.value.id)
-                else:
-                    self.has_generic_register_fake = True
-            elif isinstance(dec, ast.Call):
-                dec_name = _dotted(dec.func)
-                if dec_name.endswith("register_fake") or dec_name == "register_fake":
-                    self._record_register_fake_call(dec)
-        self.generic_visit(node)
+                    self.fake_fn_keys.add((self._binding_scope(dec.value.id), dec.value.id))
+            self.visit(dec)
+        for default in node.args.defaults:
+            self.visit(default)
+        for default in node.args.kw_defaults:
+            if default is not None:
+                self.visit(default)
+        self._push_scope()
+        for arg in (
+            list(getattr(node.args, "posonlyargs", []))
+            + node.args.args
+            + node.args.kwonlyargs
+            + ([node.args.vararg] if node.args.vararg else [])
+            + ([node.args.kwarg] if node.args.kwarg else [])
+        ):
+            self._scopes[-1][arg.arg] = None
+        for stmt in node.body:
+            self.visit(stmt)
+        self._pop_scope()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Assign(self, node):
+        # type: (ast.Assign) -> None
+        if len(node.targets) == 1:
+            self._bind_custom_op(node.targets[0], node.value)
+        self.visit(node.value)
+        for target in node.targets:
+            self._bind_local(target)
+            self.visit(target)
+
+    def visit_AnnAssign(self, node):
+        # type: (ast.AnnAssign) -> None
+        if node.value is not None:
+            self._bind_custom_op(node.target, node.value)
+            self.visit(node.value)
+        self._bind_local(node.target)
+        self.visit(node.target)
+
+    def _bind_custom_op(self, target, value):
+        if isinstance(target, ast.Name) and isinstance(value, ast.Call):
+            resolved, _ = self._resolve(value.func)
+            if _library_call(resolved, "custom_op"):
+                self.custom_op_bindings[id(value)] = (self._scope_ids[-1], target.id)
 
     def visit_ClassDef(self, node):
         # type: (ast.ClassDef) -> None
+        self._scopes[-1][node.name] = None
+        for dec in node.decorator_list:
+            self.visit(dec)
         for base in node.bases:
-            base_name = _dotted(base)
-            if base_name.endswith("autograd.Function") or base_name == "Function":
+            resolved, _ = self._resolve(base)
+            if resolved.endswith("autograd.Function") or resolved == "Function":
                 self._emit(node, "custom_autograd")
+            self.visit(base)
+        for kw in node.keywords:
+            self.visit(kw)
         if node.name in ("Muon", "DistributedMuon"):
             self._emit(node, "non_adamw_optimizer")
-        self.generic_visit(node)
+        self._push_scope()
+        for stmt in node.body:
+            self.visit(stmt)
+        self._pop_scope()
 
     def visit_Call(self, node):
         # type: (ast.Call) -> None
-        name = _dotted(node.func)
-        tail = name.rsplit(".", 1)[-1]
+        raw = _dotted(node.func)
+        resolved, is_imported = self._resolve(node.func)
+        tail = resolved.rsplit(".", 1)[-1] if resolved else ""
         kw = _kw_map(node)
         keywords = set(kw.keys())
 
-        if tail == "AdamW" and not ({"fused", "foreach"} & keywords):
+        matched_constructor = False
+        if _is_torch_adamw(resolved, raw, is_imported) and not ({"fused", "foreach"} & keywords):
             self._emit(node, "adamw_not_fused")
         elif tail in ("Muon", "DistributedMuon", "batched_newton_schulz"):
             self._emit(node, "non_adamw_optimizer")
-        elif tail in ("flex_attention", "create_block_mask", "create_mask"):
+        elif tail in ("flex_attention", "create_block_mask") or (
+            tail == "create_mask"
+            and resolved in ("create_mask", "flex_attention.create_mask", "torch.nn.attention.flex_attention.create_mask")
+        ):
             self._emit(node, "flex_attention_call")
-        elif tail in ("flash_attn_varlen_func", "flash_attn_varlen_qkvpacked_func"):
+        elif tail in _FA2_VARLEN_CALLS:
             self._emit(node, "fa2_varlen_call")
         elif tail == "scaled_dot_product_attention":
             self._emit(node, "sdpa_call")
-        elif tail == "MultiheadAttention" and ("nn" in name or name == tail):
-            self._emit(node, "mha_default_avg_weights")
+        elif _is_torch_nn_symbol(resolved, raw, is_imported, "MultiheadAttention"):
+            matched_constructor = True
+            self._emit(
+                node, "mha_default_avg_weights",
+                "MHA construction is a clue. Inspect each call site for need_weights, "
+                "average_attn_weights and whether the weights are consumed.",
+            )
         elif tail == "multi_head_attention_forward":
-            avg_val = _bool_const(kw.get("average_attn_weights"))
-            need_val = _bool_const(kw.get("need_weights"))
+            avg_val = _bool_const(_call_argument(node, kw, "average_attn_weights", 23))
+            need_val = _bool_const(_call_argument(node, kw, "need_weights", 15))
             if avg_val is not False and need_val is not False:
                 self._emit(node, "mha_default_avg_weights")
-        elif tail in ("view_as_complex", "view_as_real") or (
-            tail == "polar" and (name == "polar" or name.endswith("torch.polar"))
+        elif tail == "view_as_complex" or (
+            tail == "polar" and resolved in ("polar", "torch.polar")
+        ) or (
+            tail == "view_as_real" and _looks_like_rotary_product(_call_argument(node, kw, "input", 0))
         ):
             self._emit(node, "complex_rope")
-        elif tail in ("LayerNorm", "RMSNorm") and ("nn" in name or name == tail):
+        elif (
+            _is_torch_nn_symbol(resolved, raw, is_imported, "LayerNorm")
+            or _is_torch_nn_symbol(resolved, raw, is_imported, "RMSNorm")
+        ):
+            matched_constructor = True
             self._emit(node, "layernorm_module")
         elif tail in ("Upsample", "interpolate"):
-            mode_val = _str_const(kw.get("mode"))
+            mode_position = 2 if tail == "Upsample" else 3
+            mode_val = _str_const(_call_argument(node, kw, "mode", mode_position))
             if mode_val == "bilinear":
                 self._emit(node, "upsample_bilinear")
-        elif (name.endswith("library.custom_op") or name == "custom_op") and id(node) not in self._in_custom_op_call_nodes:
-            op_name = _str_const(node.args[0]) if node.args else _str_const(kw.get("name"))
-            self.custom_ops.append((node.lineno, None, op_name))
-        elif tail == "register_fake" or name.endswith("register_fake"):
-            self._record_register_fake_call(node)
-        self.generic_visit(node)
-
-    def visit_Attribute(self, node):
-        # type: (ast.Attribute) -> None
-        if node.attr == "register_fake":
-            if isinstance(node.value, ast.Name):
-                self.fake_fn_names.add(node.value.id)
+        elif _library_call(resolved, "custom_op"):
+            op_name = _str_const(_call_argument(node, kw, "name", 0))
+            binding = self.custom_op_bindings.get(id(node))
+            if binding is not None:
+                scope_id, fn_name = binding
             else:
-                self.has_generic_register_fake = True
-        self.generic_visit(node)
+                scope_id, fn_name = self._scope_ids[-1], None
+            self.custom_ops.append((node.lineno, scope_id, fn_name, op_name))
+        elif _library_call(resolved, "register_fake"):
+            target = _call_argument(node, kw, "qualname", 0)
+            op_name = _str_const(target)
+            if op_name is not None:
+                self.fake_op_names.add(op_name)
+            elif isinstance(target, ast.Name):
+                self.fake_fn_keys.add((self._binding_scope(target.id), target.id))
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "register_fake":
+            if isinstance(node.func.value, ast.Name):
+                target_name = node.func.value.id
+                self.fake_fn_keys.add((self._binding_scope(target_name), target_name))
 
-    def visit_BinOp(self, node):
-        # type: (ast.BinOp) -> None
-        if isinstance(node.op, ast.Add):
-            for side in (node.left, node.right):
-                if isinstance(side, ast.Call) and "norm" in _dotted(side.func).lower():
-                    self._emit(node, "norm_then_add")
-                    break
+        if not matched_constructor and tail and _NORM_CALL_RE.fullmatch(tail.lower()):
+            first_arg = _call_argument(node, kw, "input", 0)
+            if isinstance(first_arg, ast.BinOp) and isinstance(first_arg.op, ast.Add):
+                self._emit(node, "add_then_norm")
+
         self.generic_visit(node)
 
 
@@ -308,23 +478,23 @@ def _scan_manual_attention(tree, path, lines):
 
 
 def scan_file(path, allowed_patterns=None):
-    # type: (str, Optional[Set[str]]) -> List[Finding]
+    # type: (str, Optional[Set[str]]) -> Tuple[Optional[List[Finding]], Optional[str]]
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with tokenize.open(path) as fh:
             source = fh.read()
         tree = ast.parse(source, filename=path)
-    except (OSError, SyntaxError) as exc:
-        print("warning: skipped {}: {}".format(path, exc), file=sys.stderr)
-        return []
+    except (OSError, SyntaxError, ValueError) as exc:
+        reason = str(exc)
+        print("warning: skipped {}: {}".format(path, reason), file=sys.stderr)
+        return None, reason
     lines = source.splitlines()
     visitor = _Visitor(path, lines)
     visitor.visit(tree)
     findings = visitor.findings + _scan_manual_attention(tree, path, lines)
 
-    for line, fn_name, op_name in visitor.custom_ops:
+    for line, scope_id, fn_name, op_name in visitor.custom_ops:
         matched = (
-            visitor.has_generic_register_fake
-            or (fn_name is not None and fn_name in visitor.fake_fn_names)
+            (fn_name is not None and (scope_id, fn_name) in visitor.fake_fn_keys)
             or (op_name is not None and op_name in visitor.fake_op_names)
         )
         if not matched:
@@ -333,16 +503,15 @@ def scan_file(path, allowed_patterns=None):
 
     if allowed_patterns is not None:
         findings = [f for f in findings if f.pattern in allowed_patterns]
-    return findings
+    return findings, None
 
 
-def _iter_files(paths):
-    # type: (Iterable[str]) -> Iterable[str]
+def _iter_files(paths, on_error):
     for path in paths:
         if os.path.isfile(path) and path.endswith(".py"):
             yield path
         elif os.path.isdir(path):
-            for root, dirs, names in os.walk(path):
+            for root, dirs, names in os.walk(path, onerror=on_error):
                 dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
                 for name in sorted(names):
                     if name.endswith(".py"):
@@ -360,6 +529,9 @@ def main(argv=None):
         help="Comma-separated subset of pattern names to report (default: all).",
     )
     args = parser.parse_args(argv)
+    for path in args.paths:
+        if not (os.path.isdir(path) or (os.path.isfile(path) and path.endswith(".py"))):
+            parser.error("expected an existing Python file or directory: {}".format(path))
 
     allowed = None  # type: Optional[Set[str]]
     if args.patterns.strip():
@@ -372,15 +544,40 @@ def main(argv=None):
         allowed = set(requested)
 
     findings = []  # type: List[Finding]
-    for path in _iter_files(args.paths):
-        findings.extend(scan_file(path, allowed_patterns=allowed))
-    findings.sort(key=lambda f: (f.file, f.line, f.pattern))
+    scanned = 0
+    skipped_files = []  # type: List[Dict[str, str]]
 
+    def walk_error(error):
+        path_name = getattr(error, "filename", None) or "<walk>"
+        reason = str(error)
+        skipped_files.append({"file": str(path_name), "reason": reason})
+        print("warning: skipped {}".format(reason), file=sys.stderr)
+
+    for path in _iter_files(args.paths, walk_error):
+        result, reason = scan_file(path, allowed_patterns=allowed)
+        if result is None:
+            skipped_files.append({"file": path, "reason": reason or "unknown error"})
+        else:
+            scanned += 1
+            findings.extend(result)
+    findings.sort(key=lambda f: (f.file, f.line, f.pattern))
+    skipped = len(skipped_files)
+
+    if skipped or not scanned:
+        print("Python files: {} scanned, {} skipped.".format(scanned, skipped), file=sys.stderr)
     if args.json:
-        print(json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2))
-        return 0
-    if not findings:
-        print("No candidates found.")
+        payload = {
+            "disclaimer": _DISCLAIMER,
+            "files_scanned": scanned,
+            "files_skipped": skipped,
+            "skipped_files": skipped_files,
+            "findings": [f.to_dict() for f in findings],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif not scanned:
+        print("No Python files scanned.")
+    elif not findings:
+        print("No candidates found in scanned files.")
     else:
         counts = {}  # type: Dict[str, int]
         for f in findings:
@@ -394,12 +591,8 @@ def main(argv=None):
             print("{}:{}  [{}]".format(f.file, f.line, f.pattern))
             print("    {}".format(f.snippet))
             print("    note: {}\n".format(f.note))
-    print(
-        "STATIC candidates only: they do not show the code is slow, that a replacement "
-        "exists for your platform, or that it is numerically equivalent. Confirm with a profiler first.",
-        file=sys.stderr,
-    )
-    return 0
+    print(_DISCLAIMER, file=sys.stderr)
+    return 1 if skipped or not scanned else 0
 
 
 if __name__ == "__main__":

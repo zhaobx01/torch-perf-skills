@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Self-test for scan_kernel_candidates.py.
 
-Verifies all 13 static candidate detectors, common false-positive boundaries
-(e.g. AdamW(fused=True), average_attn_weights=False, interpolate(mode="nearest"),
-per-custom_op register_fake matching), and CLI flags (--json, --patterns, invalid
-pattern rejection). Pure Python standard library (Python 3.6+ compatible).
+Verifies all 13 detectors, false-positive boundaries, import alias & scope-aware
+fake registration matching, JSON metadata envelope, and CLI behavior on complete
+and incomplete scans. Uses only the Python standard library (Python 3.6+ compatible).
 """
 
 import json
@@ -49,9 +48,10 @@ attn = F.softmax(q @ k.transpose(-2, -1), dim=-1)
 # Complex / polar RoPE
 freqs_cis = torch.polar(ones, freqs)
 
-# Norm & norm_then_add
+# Norm & add_then_norm (norm(x + residual), NOT norm(x) + x)
 ln = nn.LayerNorm(64)
-z = self.norm1(x) + x
+z = self.norm1(x + residual)
+z_non_fused_order = self.norm1(x) + residual
 
 # Bilinear upsample/interpolate (nearest must NOT trigger)
 u1 = nn.Upsample(scale_factor=2, mode="bilinear")
@@ -86,7 +86,7 @@ EXPECTED_COUNTS = {
     "manual_attention": 1,
     "complex_rope": 1,
     "layernorm_module": 1,
-    "norm_then_add": 1,
+    "add_then_norm": 1,
     "upsample_bilinear": 2,
     "custom_autograd": 1,
     "custom_op_missing_fake": 1,
@@ -107,15 +107,159 @@ def _run(args, expect_ok=True):
     return proc
 
 
+def test_fake_registration(directory):
+    path = os.path.join(directory, "fake_registration.py")
+    with open(path, "w") as sample:
+        sample.write('''
+import torch.library as tl
+from torch.library import custom_op as reg_op
+
+@torch.library.custom_op("ns::registered", mutates_args=())
+def registered(x): return x
+@torch.library.custom_op("ns::missing", mutates_args=())
+def missing(x): return x
+@torch.library.register_fake("ns::registered")
+def registered_fake(x): return x
+
+op = torch.library.custom_op("ns::assigned", fn, mutates_args=())
+op.register_fake(fake)
+
+@torch.library.custom_op("ns::object_argument", mutates_args=())
+def object_argument(x): return x
+@torch.library.register_fake(object_argument)
+def object_argument_fake(x): return x
+
+@tl.custom_op("ns::aliased_ok", mutates_args=())
+def aliased_ok(x): return x
+@tl.register_fake("ns::aliased_ok")
+def aliased_ok_fake(x): return x
+
+@reg_op("ns::aliased_missing", mutates_args=())
+def aliased_missing(x): return x
+
+def scope_a():
+    @tl.custom_op("ns::scoped_ok", mutates_args=())
+    def local_op(x): return x
+    @local_op.register_fake
+    def local_op_fake(x): return x
+
+def scope_b():
+    @tl.custom_op("ns::scoped_missing", mutates_args=())
+    def local_op(x): return x
+''')
+    result = _run(["--json", "--patterns", "custom_op_missing_fake", path])
+    payload = json.loads(result.stdout)
+    lines = [finding["snippet"] for finding in payload["findings"]]
+    assert lines == [
+        '@torch.library.custom_op("ns::missing", mutates_args=())',
+        '@reg_op("ns::aliased_missing", mutates_args=())',
+        '@tl.custom_op("ns::scoped_missing", mutates_args=())',
+    ], lines
+
+
+def test_api_boundaries(directory):
+    path = os.path.join(directory, "api_boundaries.py")
+    with open(path, "w") as sample:
+        sample.write('''
+from other_pkg import AdamW as ForeignAdamW
+from torch.optim import AdamW as TorchAdamW
+
+a = image.create_mask(x)
+b = metric.normalize(x + residual)
+c = torch.view_as_real(fft_x)
+d = torch.view_as_real(y * freqs)
+e = torch.optim.AdamW(params, **{"fused": True})
+e_foreign = ForeignAdamW(params)
+e_torch = TorchAdamW(params)
+f = flash_attn_varlen_with_mask_func(q, k, v, cu_q, cu_k)
+g = F.interpolate(x, None, 2, "bilinear")
+h = F.multi_head_attention_forward(q, k, v, d, h, w, b, bk, bv,
+                                   False, 0, ow, ob, True, None, False)
+i = nn.MultiheadAttention(32, 4)
+i_bad_norm = cnn.LayerNorm(64)
+j = self.layernorm1(x + residual)
+k = self.rmsnorm(x + residual)
+m = self.norm1(x) + residual
+''')
+    result = _run(["--json", path])
+    payload = json.loads(result.stdout)
+    findings = payload["findings"]
+    assert {item["line"]: item["pattern"] for item in findings} == {
+        8: "complex_rope",
+        11: "adamw_not_fused",
+        12: "fa2_varlen_call",
+        13: "upsample_bilinear",
+        16: "mha_default_avg_weights",
+        18: "add_then_norm",
+        19: "add_then_norm",
+    }, findings
+    mha = next(item for item in findings if item["pattern"] == "mha_default_avg_weights")
+    assert "call site" in mha["note"], mha
+
+
+def test_scan_status(directory):
+    valid = os.path.join(directory, "valid.py")
+    invalid = os.path.join(directory, "broken.py")
+    with open(valid, "w") as sample:
+        sample.write("x = 1\n")
+    with open(invalid, "w") as sample:
+        sample.write("def invalid(\n")
+
+    result = _run(["--json", valid])
+    payload = json.loads(result.stdout)
+    assert payload["findings"] == [], payload
+    assert payload["files_scanned"] == 1 and payload["files_skipped"] == 0, payload
+    assert payload["skipped_files"] == [], payload
+    assert "STATIC candidates only" in payload["disclaimer"], payload
+    assert "STATIC candidates only" in result.stderr, result.stderr
+
+    result = _run(["--json", valid, invalid], expect_ok=False)
+    payload = json.loads(result.stdout)
+    assert payload["findings"] == [], payload
+    assert payload["files_scanned"] == 1 and payload["files_skipped"] == 1, payload
+    assert len(payload["skipped_files"]) == 1 and payload["skipped_files"][0]["file"] == invalid, payload
+    assert "STATIC candidates only" in payload["disclaimer"], payload
+    assert "1 scanned" in result.stderr and "1 skipped" in result.stderr, result.stderr
+    assert "STATIC candidates only" in result.stderr, result.stderr
+
+    result = _run([invalid], expect_ok=False)
+    assert "No Python files scanned" in result.stdout, result.stdout
+
+    empty = os.path.join(directory, "empty")
+    os.mkdir(empty)
+    result = _run([empty], expect_ok=False)
+    assert "No Python files scanned" in result.stdout, result.stdout
+    _run([os.path.join(directory, "missing.py")], expect_ok=False)
+
+
+def test_source_encoding_and_parse_error(directory):
+    encoded = os.path.join(directory, "encoded.py")
+    malformed = os.path.join(directory, "nul.py")
+    with open(encoded, "wb") as sample:
+        sample.write(b"# coding: cp1252\ncaf\xe9 = torch.optim.AdamW(params)\n")
+    with open(malformed, "wb") as sample:
+        sample.write(b"x = 1\x00\n")
+
+    result = _run(["--json", encoded, malformed], expect_ok=False)
+    assert "1 scanned" in result.stderr and "1 skipped" in result.stderr, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["files_scanned"] == 1 and payload["files_skipped"] == 1, payload
+    findings = payload["findings"]
+    assert [item["snippet"] for item in findings] == ["caf\u00e9 = torch.optim.AdamW(params)"], findings
+
+
 def main():
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
         tf.write(SYNTHETIC_SAMPLE)
         sample_path = tf.name
 
     try:
-        # 1. JSON mode: all 13 patterns + false-positive boundaries
+        # 1. JSON mode: all 13 patterns + false-positive boundaries + envelope metadata
         res_json = _run(["--json", sample_path])
-        findings = json.loads(res_json.stdout)
+        payload = json.loads(res_json.stdout)
+        assert "STATIC candidates only" in payload["disclaimer"], payload
+        assert payload["files_scanned"] == 1 and payload["files_skipped"] == 0, payload
+        findings = payload["findings"]
         counts = {}
         for item in findings:
             p = item["pattern"]
@@ -133,7 +277,13 @@ def main():
         # 3. Unknown pattern must exit non-zero
         _run(["--patterns", "does_not_exist", sample_path], expect_ok=False)
 
-        print("selftest PASSED: {} patterns verified, false-positive boundaries & CLI OK.".format(
+        with tempfile.TemporaryDirectory() as directory:
+            test_fake_registration(directory)
+            test_api_boundaries(directory)
+            test_scan_status(directory)
+            test_source_encoding_and_parse_error(directory)
+
+        print("selftest PASSED: {} detectors plus alias/scoped fake registration, API boundaries, JSON envelope and CLI status.".format(
             len(EXPECTED_COUNTS)
         ))
     finally:
