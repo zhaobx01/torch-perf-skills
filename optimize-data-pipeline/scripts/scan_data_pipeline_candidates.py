@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Static scanner for PyTorch training data-pipeline and H2D feeding candidates.
 
-This is a STATIC scanner. It scans Python source files (AST, with regex fallback
-for newer Python syntax on older runtimes) and YAML/JSON config files for:
+This is a STATIC scanner. It scans Python source files (AST, with partial
+recovery at info severity for unparseable files) and YAML/JSON config files for:
   - DataLoader construction with num_workers=0, pin_memory=False/omitted, or
     persistent_workers=False/omitted when num_workers > 0 (downgraded to info
     inside eval/test/val helpers).
@@ -16,8 +16,9 @@ for newer Python syntax on older runtimes) and YAML/JSON config files for:
   - Loop-based Shapely/geometry .interpolate() calls on CPU dataset workers.
 
 It does NOT prove the DataLoader or H2D copy is a real bottleneck, check host
-RAM / /dev/shm headroom, or verify sampler/resume equivalence. Always confirm
-step-start idle gaps and H2D exposure with a profiler trace before optimizing.
+RAM / /dev/shm headroom, or verify sampler/resume equivalence. Check the runtime
+call path and trace before treating a finding as a measured bottleneck.
+JSON config findings use a key path; line 0 means the source line is ambiguous.
 
 Usage:
     python3 scan_data_pipeline_candidates.py <file-or-dir> [<file-or-dir> ...]
@@ -30,10 +31,12 @@ Only the Python standard library is used (compatible with Python 3.6+).
 
 import argparse
 import ast
+import io
 import json
 import os
 import re
 import sys
+import tokenize
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
@@ -61,6 +64,9 @@ _EVAL_TOKENS = (
 )
 
 _SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3}
+_CONTAINER_TRANSFER_HELPERS = {"pin_memory", "_pin_memory", "_to_cuda"}
+_MODEL_RECEIVERS = {"model", "module", "net", "network", "policy"}
+_ACCELERATOR_DEVICES = {"cuda", "hip", "npu", "xpu", "mps"}
 
 _NOTES = {
     "dataloader_num_workers_zero": (
@@ -68,8 +74,8 @@ _NOTES = {
         "dataset for TF/RLDS thread-pool datasets, see D1/D3)."
     ),
     "dataloader_pin_memory_disabled": (
-        "DataLoader disables or omits pin_memory; pinned host memory is required for true "
-        "non_blocking H2D and copy-stream prefetch (check host RAM / /dev/shm budget, see D1)."
+        "DataLoader disables or omits pin_memory; verify source pinning for H2D/compute "
+        "overlap and check host RAM / /dev/shm budget (see D1/D4)."
     ),
     "dataloader_persistent_workers_off": (
         "Multi-worker DataLoader disables or omits persistent_workers; enabling it avoids "
@@ -192,6 +198,7 @@ class _PythonVisitor(ast.NodeVisitor):
         self._func_stack: List[str] = []
         self._loop_depth = 0
         self._emitted_dc = False
+        self._functional_modules = {"F"}
 
     def _in_eval_context(self, extra_name: str = "") -> bool:
         if extra_name and _looks_like_eval_name(extra_name):
@@ -207,14 +214,25 @@ class _PythonVisitor(ast.NodeVisitor):
         )
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        inherited_modules = self._functional_modules
+        argument_names = {arg.arg for arg in ast.iter_child_nodes(node.args) if isinstance(arg, ast.arg)}
+        self._functional_modules = inherited_modules - argument_names
         self._func_stack.append(node.name)
         self.generic_visit(node)
         self._func_stack.pop()
+        self._functional_modules = inherited_modules
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._func_stack.append(node.name)
-        self.generic_visit(node)
-        self._func_stack.pop()
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "torch.nn.functional":
+                self._functional_modules.add(alias.asname or alias.name)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if node.module == "torch.nn" and alias.name == "functional":
+                self._functional_modules.add(alias.asname or alias.name)
 
     def visit_For(self, node: ast.For) -> None:
         self._loop_depth += 1
@@ -246,9 +264,14 @@ class _PythonVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        self._check_call(node)
+        self.generic_visit(node)
+
+    def _check_call(self, node: ast.Call) -> None:
         name = _dotted(node.func)
         tail = name.rsplit(".", 1)[-1] if name else ""
         kw_map = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+        has_star_kwargs = any(kw.arg is None for kw in node.keywords)
         eval_ctx = self._in_eval_context()
 
         if tail == "DataLoader":
@@ -268,11 +291,11 @@ class _PythonVisitor(ast.NodeVisitor):
                     "dataloader_pin_memory_disabled",
                     "info" if eval_ctx else "high",
                 )
-            elif "pin_memory" not in kw_map and not eval_ctx:
+            elif "pin_memory" not in kw_map and not has_star_kwargs and not eval_ctx:
                 self._emit(node, "dataloader_pin_memory_disabled", "medium")
 
             if nw_val is not None and nw_val > 0:
-                if pw_val is False or "persistent_workers" not in kw_map:
+                if pw_val is False or ("persistent_workers" not in kw_map and not has_star_kwargs):
                     self._emit(
                         node,
                         "dataloader_persistent_workers_off",
@@ -280,7 +303,7 @@ class _PythonVisitor(ast.NodeVisitor):
                     )
 
         elif tail == "Accelerator":
-            if "dataloader_config" not in kw_map:
+            if "dataloader_config" not in kw_map and not has_star_kwargs:
                 self._emit(
                     node,
                     "accelerator_blocking_h2d",
@@ -289,7 +312,7 @@ class _PythonVisitor(ast.NodeVisitor):
 
         elif tail == "DataLoaderConfiguration":
             nb_val = _is_bool_const(kw_map.get("non_blocking"))
-            if nb_val is False or "non_blocking" not in kw_map:
+            if nb_val is False or ("non_blocking" not in kw_map and not has_star_kwargs):
                 self._emit(
                     node,
                     "accelerator_blocking_h2d",
@@ -297,116 +320,145 @@ class _PythonVisitor(ast.NodeVisitor):
                 )
 
         elif tail == "cuda" and isinstance(node.func, ast.Attribute):
-            # Ignore torch.cuda.* namespace calls; target tensor.cuda(...)
-            if not name.startswith("torch.cuda"):
-                nb_val = _is_bool_const(kw_map.get("non_blocking"))
-                if nb_val is not True:
-                    self._emit(
-                        node,
-                        "blocking_h2d_transfer",
-                        "info" if eval_ctx else "medium",
-                    )
+            if name != "torch.cuda":
+                self._check_transfer(node, kw_map, has_star_kwargs, eval_ctx)
 
         elif tail == "to" and isinstance(node.func, ast.Attribute):
-            nb_val = _is_bool_const(kw_map.get("non_blocking"))
-            if nb_val is not True and self._looks_like_device_to(node, kw_map):
-                self._emit(
-                    node,
-                    "blocking_h2d_transfer",
-                    "info" if eval_ctx else "medium",
-                )
+            if self._looks_like_device_to(node, kw_map):
+                self._check_transfer(node, kw_map, has_star_kwargs, eval_ctx)
 
         elif tail == "DataContainer" and not self.has_pin_memory_def and not self._emitted_dc:
-            self._emitted_dc = True
-            self._emit(node, "custom_datacontainer_pin_risk", "medium")
+            if not any(scope in _CONTAINER_TRANSFER_HELPERS for scope in self._func_stack):
+                self._emitted_dc = True
+                self._emit(node, "custom_datacontainer_pin_risk", "medium")
 
-        elif tail == "interpolate" and self._loop_depth > 0:
-            # Skip torch.nn.functional.interpolate / F.interpolate (tensor resize, not Shapely geometry)
-            if not name.endswith(("F.interpolate", "functional.interpolate")):
+        elif tail == "interpolate" and self._loop_depth > 0 and isinstance(node.func, ast.Attribute):
+            receiver = _dotted(node.func.value)
+            if receiver not in self._functional_modules and not receiver.endswith(".functional"):
                 self._emit(node, "geometry_interpolate_loop", "medium")
 
-        self.generic_visit(node)
+    def _check_transfer(self, node: ast.Call, kw_map: Dict[str, ast.AST],
+                        has_star_kwargs: bool, eval_ctx: bool) -> None:
+        nb_val = _is_bool_const(kw_map.get("non_blocking"))
+        if not self._looks_like_model(node.func.value) and (nb_val is False or (nb_val is None and not has_star_kwargs)):
+            self._emit(node, "blocking_h2d_transfer", "info" if eval_ctx else "medium")
+
+    @staticmethod
+    def _looks_like_model(node: ast.AST) -> bool:
+        return _dotted(node).lower().rsplit(".", 1)[-1] in _MODEL_RECEIVERS
 
     def _looks_like_device_to(
         self, node: ast.Call, kw_map: Dict[str, ast.AST]
     ) -> bool:
-        # Check explicit device= kwarg
+        target = kw_map.get("device", node.args[0] if node.args else None)
+        if isinstance(target, ast.Call) and _dotted(target.func) == "torch.device":
+            device_type = _is_str_const(target.args[0]) if target.args else None
+            return device_type is None or device_type.lower().split(":", 1)[0] in _ACCELERATOR_DEVICES
+        device_type = _is_str_const(target)
+        if device_type is not None:
+            return device_type.lower().split(":", 1)[0] in _ACCELERATOR_DEVICES
         if "device" in kw_map:
-            s = _is_str_const(kw_map["device"])
-            if s is not None and s.lower().startswith("cpu"):
-                return False
             return True
-        # Check first positional argument if it looks like a GPU/accelerator device
-        if node.args:
-            arg0 = node.args[0]
-            s = _is_str_const(arg0)
-            if s is not None:
-                return s.lower().startswith(("cuda", "hip", "npu", "xpu"))
-            arg_name = _dotted(arg0).lower()
-            if "dtype" in arg_name or arg_name.startswith("torch."):
-                return False
-            if any(tok in arg_name for tok in ("device", "cuda", "rank", "gpu")):
-                return True
-        return False
+        arg_name = _dotted(target).lower()
+        return ("dtype" not in arg_name and not arg_name.startswith("torch.")
+                and any(tok in arg_name for tok in ("device", "cuda", "rank", "gpu")))
 
 
-def _scan_python_regex_fallback(path: str, lines: List[str]) -> List[Finding]:
-    """Regex fallback when a Python file uses newer syntax than the running interpreter."""
-    findings: List[Finding] = []
-    has_pin_def = any("def pin_memory" in l for l in lines)
-    dc_emitted = False
-    stripped_lines = [l.split("#", 1)[0] for l in lines]
-    full_code = "\n".join(stripped_lines)
+_FALLBACK_CALLS = {"DataLoader", "Accelerator", "DataLoaderConfiguration", "DataContainer"}
+_BRACKETS = {"(": ")", "[": "]", "{": "}"}
+# Older CPython can report a parser-stack overflow as MemoryError.
+_AST_PARSE_ERRORS = (SyntaxError, MemoryError, RecursionError)
 
-    def _line_of_offset(offset: int) -> int:
-        return full_code.count("\n", 0, offset) + 1
 
-    # Multiline DataLoader(...) scan
-    for m in re.finditer(r"\bDataLoader\s*\(([^)]{0,800})\)", full_code, re.S):
-        body = m.group(1)
-        ln = _line_of_offset(m.start())
-        snip = lines[ln - 1].strip() if 0 < ln <= len(lines) else "DataLoader(...)"
-        if re.search(r"\bnum_workers\s*=\s*0\b", body):
-            findings.append(
-                Finding(path, ln, 0, "dataloader_num_workers_zero", "high", snip, _NOTES["dataloader_num_workers_zero"])
-            )
-        if re.search(r"\bpin_memory\s*=\s*False\b", body):
-            findings.append(
-                Finding(path, ln, 0, "dataloader_pin_memory_disabled", "high", snip, _NOTES["dataloader_pin_memory_disabled"])
-            )
-        elif not re.search(r"\bpin_memory\s*=", body):
-            findings.append(
-                Finding(path, ln, 0, "dataloader_pin_memory_disabled", "medium", snip, _NOTES["dataloader_pin_memory_disabled"])
-            )
-
-    # Multiline Accelerator(...) without dataloader_config=
-    for m in re.finditer(r"\bAccelerator\s*\(([^)]{0,800})\)", full_code, re.S):
-        body = m.group(1)
-        if not re.search(r"\bdataloader_config\s*=", body):
-            ln = _line_of_offset(m.start())
-            snip = lines[ln - 1].strip() if 0 < ln <= len(lines) else "Accelerator(...)"
-            findings.append(
-                Finding(path, ln, 0, "accelerator_blocking_h2d", "high", snip, _NOTES["accelerator_blocking_h2d"])
-            )
-
-    for idx, raw in enumerate(lines, 1):
-        code = stripped_lines[idx - 1]
-        if not code.strip():
+def _bracket_pairs(tokens):
+    pairs = {}
+    stack = []
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP:
             continue
-        if re.search(r"\bDataLoaderConfiguration\s*\(.*\bnon_blocking\s*=\s*False\b", code):
-            findings.append(
-                Finding(path, idx, 0, "accelerator_blocking_h2d", "high", raw.strip(), _NOTES["accelerator_blocking_h2d"])
-            )
-        if re.search(r"hf_dataset\s*\[[^\]]+\]\s*\[", code):
-            findings.append(
-                Finding(path, idx, 0, "hf_dataset_full_row_index", "medium", raw.strip(), _NOTES["hf_dataset_full_row_index"])
-            )
-        if not has_pin_def and not dc_emitted and re.search(r"\bDataContainer\s*\(", code):
-            dc_emitted = True
-            findings.append(
-                Finding(path, idx, 0, "custom_datacontainer_pin_risk", "medium", raw.strip(), _NOTES["custom_datacontainer_pin_risk"])
-            )
-    return findings
+        if token.string in _BRACKETS:
+            stack.append((index, _BRACKETS[token.string]))
+        elif token.string in (")", "]", "}"):
+            if stack and token.string == stack[-1][1]:
+                opening, _ = stack.pop()
+                pairs[opening] = index
+            else:
+                stack.clear()
+    return pairs
+
+
+def _recover_call(name_token, closing_token, source, offsets):
+    """Parse one balanced call within a file that the full AST cannot read."""
+    start_line, start_col = name_token.start
+    end_line, end_col = closing_token.end
+    call = source[offsets[start_line - 1] + start_col:offsets[end_line - 1] + end_col]
+    try:
+        tree = ast.parse(call, mode="eval")
+    except _AST_PARSE_ERRORS:
+        return None
+    return ast.increment_lineno(tree, start_line - 1)
+
+
+def _scan_python_fallback(path: str, source: str, lines: List[str]) -> List[Finding]:
+    """Recover isolated calls and recognizable HF indexing at info severity."""
+    tokens = []
+    try:
+        tokens.extend(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError):
+        pass  # Complete calls before the malformed region are still usable.
+
+    offsets = []
+    offset = 0
+    for line in source.splitlines(keepends=True):
+        offsets.append(offset)
+        offset += len(line)
+
+    has_pin_def = any(
+        token.type == tokenize.NAME and token.string == "def"
+        and tokens[index + 1].string == "pin_memory"
+        for index, token in enumerate(tokens[:-1])
+    )
+    visitor = _PythonVisitor(path, lines, has_pin_def)
+    bracket_pairs = _bracket_pairs(tokens)
+    for index, token in enumerate(tokens[1:], 1):
+        previous = tokens[index - 1]
+        if token.type != tokenize.OP or token.string != "(" or previous.type != tokenize.NAME:
+            continue
+        if previous.string not in _FALLBACK_CALLS or (index >= 2 and tokens[index - 2].string in ("def", "class")):
+            continue
+        closing = bracket_pairs.get(index)
+        if closing is None:
+            continue
+        tree = _recover_call(previous, tokens[closing], source, offsets)
+        if tree is not None:
+            tree.body.col_offset = previous.start[1]
+            # Nested constructor calls are recovered separately.
+            visitor._check_call(tree.body)
+
+    # Match on tokenized logical lines so comments and strings cannot supply
+    # synthetic subscript syntax.
+    statement = []
+    for token in tokens:
+        if token.type in (tokenize.NAME, tokenize.OP, tokenize.NUMBER, tokenize.STRING):
+            statement.append(token)
+        elif token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            statement_pairs = _bracket_pairs(statement)
+            for index, (first, second) in enumerate(zip(statement, statement[1:])):
+                if first.string != "hf_dataset" or second.string != "[":
+                    continue
+                closing = statement_pairs.get(index + 1)
+                if closing is not None and closing + 1 < len(statement) and statement[closing + 1].string == "[":
+                    line, col = first.start
+                    visitor.findings.append(Finding(
+                        path, line, col, "hf_dataset_full_row_index", "info",
+                        lines[line - 1].strip(), _NOTES["hf_dataset_full_row_index"],
+                    ))
+            statement.clear()
+
+    for finding in visitor.findings:
+        finding.severity = "info"
+        finding.note += " Partial Python parse; confirm the source context."
+    return visitor.findings
 
 
 def scan_python_file(path: str) -> List[Finding]:
@@ -421,11 +473,15 @@ def scan_python_file(path: str) -> List[Finding]:
         "" if line.strip() == "from __future__ import annotations" else line
         for line in lines
     )
-    has_pin_def = any("def pin_memory" in l for l in lines)
     try:
         tree = ast.parse(clean_source, filename=path)
-    except SyntaxError:
-        return _scan_python_regex_fallback(path, lines)
+    except _AST_PARSE_ERRORS:
+        return _scan_python_fallback(path, source, lines)
+    has_pin_def = any(
+        isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)) and method.name == "pin_memory"
+        for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "DataContainer"
+        for method in node.body
+    )
     visitor = _PythonVisitor(path, lines, has_pin_def)
     visitor.visit(tree)
     return visitor.findings
@@ -435,6 +491,7 @@ _CONFIG_KEY_CHECKS = (
     (re.compile(r"^\s*(?:pin_memory|persistent_workers|non_blocking)\s*:\s*false\b", re.I), "medium"),
     (re.compile(r"^\s*(?:num_workers|workers_per_gpu)\s*:\s*0\b", re.I), "high"),
 )
+_JSON_STRING = re.compile(r'("(?:[^"\\]|\\.)*")\s*(:)?')
 
 
 def scan_config_file(path: str) -> List[Finding]:
@@ -455,32 +512,33 @@ def scan_config_file(path: str) -> List[Finding]:
             obj = json.loads(raw_text)
         except Exception:
             return []
-        # Walk JSON keys and map back to line numbers best-effort
-        hits: List[Tuple[str, object]] = []
+        hits = []
 
-        def _walk(node: object) -> None:
+        def _walk(node: object, location: str = "") -> None:
             if isinstance(node, dict):
                 for k, v in node.items():
-                    kl = str(k).lower()
+                    key_path = location + "." + k if location else k
+                    kl = k.lower()
                     if kl in ("pin_memory", "persistent_workers", "non_blocking") and v is False:
-                        hits.append((k, v))
+                        hits.append((k, key_path, v, "medium"))
                     elif kl in ("num_workers", "workers_per_gpu") and v == 0 and not isinstance(v, bool):
-                        hits.append((k, v))
-                    _walk(v)
+                        hits.append((k, key_path, v, "high"))
+                    _walk(v, key_path)
             elif isinstance(node, list):
-                for item in node:
-                    _walk(item)
+                for i, item in enumerate(node):
+                    _walk(item, "{}[{}]".format(location, i))
 
         _walk(obj)
-        for key, val in hits:
-            ln = 1
-            for i, line in enumerate(lines, 1):
-                if ('"%s"' % key) in line:
-                    ln = i
-                    break
-            sev = "high" if key.lower() in ("num_workers", "workers_per_gpu") else "medium"
+        locations = {key: None for key, _, _, _ in hits}
+        for match in _JSON_STRING.finditer(raw_text):
+            if match.group(2):
+                key = json.loads(match.group(1))
+                if key in locations:
+                    locations[key] = raw_text.count("\n", 0, match.start()) + 1 if locations[key] is None else 0
+        for key, key_path, val, sev in hits:
             findings.append(
-                Finding(path, ln, 0, "config_data_pipeline_flag", sev, "%s: %r" % (key, val), _NOTES["config_data_pipeline_flag"])
+                Finding(path, locations[key] or 0, 0, "config_data_pipeline_flag", sev,
+                        "%s: %r" % (key_path, val), _NOTES["config_data_pipeline_flag"])
             )
         return findings
 
@@ -537,6 +595,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Skip YAML/JSON config files and scan Python files only",
     )
     args = parser.parse_args(argv)
+    missing = [path for path in args.paths if not os.path.exists(path)]
+    if missing:
+        print("error: path not found: " + ", ".join(missing), file=sys.stderr)
+        return 2
 
     min_rank = _SEVERITY_ORDER[args.min_severity]
     findings: List[Finding] = []
@@ -559,14 +621,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         summary = ", ".join("%d %s" % (n, p) for p, n in sorted(counts.items()))
         print("%d static candidate(s): %s\n" % (len(findings), summary))
         for f in findings:
-            print("%s:%d  [%s | %s]" % (f.file, f.line, f.severity, f.pattern))
+            location = "%s:%d" % (f.file, f.line) if f.line else f.file
+            print("%s  [%s | %s]" % (location, f.severity, f.pattern))
             print("    %s" % f.snippet)
             print("    note: %s\n" % f.note)
 
     print(
         "STATIC candidates only: they do not prove data loading or H2D copies are a real "
-        "bottleneck, verify host RAM / /dev/shm headroom, or confirm speedup. Validate with "
-        "a profiler trace first.",
+        "bottleneck, verify host RAM / /dev/shm headroom, or confirm speedup. Confirm the runtime "
+        "path and use a profiler trace when available.",
         file=sys.stderr,
     )
     return 0

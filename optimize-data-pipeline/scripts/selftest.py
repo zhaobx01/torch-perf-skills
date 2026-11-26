@@ -12,9 +12,6 @@ import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCANNER = os.path.join(SCRIPT_DIR, "scan_data_pipeline_candidates.py")
-sys.path.insert(0, SCRIPT_DIR)
-
-import scan_data_pipeline_candidates as sdpc  # noqa: E402
 
 
 SAMPLE_TRUE_POSITIVES_PY = """
@@ -125,6 +122,69 @@ def run_cli(*args):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def check_regressions(tmp):
+    # Each fixture exercises a distinct CLI inference or location boundary.
+    cases = (
+        ("loader_kwargs.py", "DataLoader(ds, **dict(pin_memory=True))\n", []),
+        ("accelerator_kwargs.py", "Accelerator(**options)\n", []),
+        ("model_cuda.py", "def make_model(self):\n    return self.model.cuda()\n", []),
+        ("explicit_device.py", "batch.to(torch.device('cuda'))\nbatch.to(device=torch.device('cpu'))\n",
+         [(1, "medium", "blocking_h2d_transfer")]),
+        ("explicit_copy_flag.py", "batch.to('cuda', non_blocking=False, **options)\n"
+         "batch.cuda(non_blocking=False, **options)\nbatch.to('cuda', **options)\n",
+         [(1, "medium", "blocking_h2d_transfer"), (2, "medium", "blocking_h2d_transfer")]),
+        ("interpolate_alias.py", "from torch.nn.functional import interpolate as resize\n"
+         "import torch.nn.functional as ops\n"
+         "for item in batch:\n    ops.interpolate(item)\n    resize(item)\n", []),
+        ("interpolate_receivers.py", "for index in indices:\n"
+         "    lines[index].interpolate(0.5)\n    make_line(index).interpolate(0.5)\n",
+         [(2, "medium", "geometry_interpolate_loop"), (3, "medium", "geometry_interpolate_loop")]),
+        ("interpolate_scope.py", "def resize_batch(items):\n    import torch.nn.functional as ops\n"
+         "    for item in items:\n        ops.interpolate(item)\n"
+         "def sample_geometry(ops, distances):\n    for d in distances:\n        ops.interpolate(d)\n",
+         [(7, "medium", "geometry_interpolate_loop")]),
+        ("local_pin.py", "def _pin_memory(batch):\n    return DataContainer(batch.pin_memory())\n"
+         "def collate(batch):\n    return DataContainer(batch)\n",
+         [(4, "medium", "custom_datacontainer_pin_risk")]),
+        ("container_transfer.py", "def _to_cuda(batch):\n    return DataContainer(_to_cuda(batch.data))\n"
+         "def collate(batch):\n    return DataContainer(batch)\n",
+         [(4, "medium", "custom_datacontainer_pin_risk")]),
+        ("fallback_nested.py", "if ===:\n    DataLoader(ds, collate_fn=make(), pin_memory=True)\n", []),
+        ("fallback_eval.py", "def eval_loader(ds):\n    if ===:\n"
+         "        DataLoader(ds, num_workers=0, pin_memory=False)\n",
+         [(3, "info", "dataloader_num_workers_zero"), (3, "info", "dataloader_pin_memory_disabled")]),
+        ("fallback_hf.py", "if ===:\n    row = hf_dataset[0] # hf_dataset[0]['image']\n"
+         "    image = hf_dataset[0]['image']\n",
+         [(3, "info", "hf_dataset_full_row_index")]),
+        ("fallback_unclosed.py", "DataLoader(ds, pin_memory=False)\n" + "DataLoader(\n" * 300,
+         [(1, "info", "dataloader_pin_memory_disabled")]),
+    )
+    failures = []
+    for filename, source, expected in cases:
+        path = os.path.join(tmp, filename)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(source)
+        rc, out, err = run_cli("--json", path)
+        assert rc == 0, err
+        actual = [(item["line"], item["severity"], item["pattern"]) for item in json.loads(out)]
+        if actual != expected:
+            failures.append("%s: expected %r, got %r" % (filename, expected, actual))
+
+    path = os.path.join(tmp, "repeated_keys.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{\n  "eval": {"pin_memory": true},\n  "train": {"pin_memory": false}\n}\n')
+    rc, out, err = run_cli("--json", path)
+    assert rc == 0, err
+    items = json.loads(out)
+    if len(items) != 1 or items[0]["line"] not in (0, 3) or "train.pin_memory" not in items[0]["snippet"]:
+        failures.append("repeated_keys.json: expected the train key with a correct or unknown line, got %r" % items)
+
+    rc, out, err = run_cli("--json", os.path.join(tmp, "absent.py"))
+    if rc != 2 or out or "absent.py" not in err:
+        failures.append("absent.py: expected exit 2 and a path diagnostic, got %r" % ((rc, out, err),))
+    assert not failures, "\n" + "\n".join(failures)
+
+
 def main():
     # 1. CLI --help check
     rc, out, err = run_cli("--help")
@@ -197,7 +257,9 @@ def main():
         assert rc == 0, err
         assert json.loads(out) == []
 
-    print("selftest passed: all TP, FP, fallback, config, and CLI checks OK.")
+        check_regressions(tmp)
+
+    print("selftest passed: all TP, FP, fallback, config, CLI, and regression checks OK.")
 
 
 if __name__ == "__main__":
