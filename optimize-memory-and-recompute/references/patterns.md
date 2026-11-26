@@ -1,102 +1,52 @@
-# 显存、重算与 GC 抖动优化模式（M1–M7）
+# 显存、重算与 GC 抖动优化模式
 
-以下模式按 **Before 坏味道 → After 手法 → 前提与不适用 → 最小验证** 组织。所有 `[已核实改造案例]` 均已对照 TurboPhysAI 16 模型快照的 Before 基线与 After 实现源码核实（见 [turbophysai-memory-evidence.md](turbophysai-memory-evidence.md)），不含未复测的性能或显存收益承诺。
+证据状态描述 [TurboPhysAI 源码对照](turbophysai-memory-evidence.md) 的核实范围。将历史实现、目标项目运行命中与量化收益分别报告。具体检查见 [验收与回退](validation.md)。
 
----
+## M1 调整激活检查点（AC）范围 · 已核实改造案例
 
-## M1 显存富余时削减或关闭冗余激活检查点（AC）`[已核实改造案例]`
+- **Before 信号**。整模块、整层或内外多级 checkpoint 均开启，反向有重算成本；或目标训练路径只有部分 AC，峰值由未覆盖的激活主导。先定位实际训练前向和嵌套关系。
+- **改法**。显存不足时为高峰值、未覆盖的区域增加普通 AC。显存有余量时，由局部到整体考虑前/尾 N 层、按步长选择或关闭明确冗余的组件。逐层标明 AC 状态以及实际被 checkpoint 的尾部归一化等边界算子。配置字典传入外部 API 时复制后修改。
+- **前提和回退**。使用最坏形状的基线 allocated、reserved 与并行/编译叠加预算。内外层可独立控制时做消融；共享初始化布局、forward 或 wrapper 契约时成组启停。存在外层编译时，检查 Python 层号及分支是否产生额外变体，保持 eval、单分支和原 checkpoint 路径的语义。复用已安装包装或编译图前先确认其状态与当前开关一致。
+- **最小验证**。记录实际各层 checkpoint 命中、图变体变化、输出/loss/梯度、最坏形状峰值和无 Profiler 稳态步时。
 
-- **Before 坏味道**：显存余量充足，但模型或骨干网络仍全层开启 activation checkpointing（如 `with_cp=True`、全层 `gradient_checkpointing=True` 或循环内每层调 `torch.utils.checkpoint.checkpoint`），导致反向阶段白白重算约一遍前向。
-- **After 手法（由粗到细三档）**：
-  1. **整模块关闭**：仅当实测峰值显存与最坏输入形状均留有充足余量时，将子模块 `with_cp` 设为 `False`（注意复制 config 避免原地污染调用方字典）。
-  2. **按前/尾 N 层关闭**：关闭前 N 个小层或尾部 `tail_layers` 层的整层重算（`layer.gradient_checkpointing = False` 或跳过包装），在显存预算内线性回收计算量。
-  3. **按步长间隔重算（`layer_stride`）**：每 `stride` 层仅 checkpoint 一次（`stride=0` 全关、`stride=2` 隔层重算）。**与 `torch.compile` 耦合要点**：若外层存在 `torch.compile`，不要对 `checkpoint` helper 做按层号分支的薄包装（Dynamo 会为每个层号产出独立图变体），应直接在 forward 循环里按步长分支调用或让 `stride=0` 走直连路径。
-- **前提与不适用**：
-  - **硬前置门槛**：必须先有基线实测峰值显存（`allocated` & `reserved`），并按**最坏序列长度 / 最大 batch**估算安全余量；不可用短步小输入代替验收。
-  - 若后续计划叠加 FSDP `forward_prefetch`、`reshard_after_forward=False` 或 `torch.compile`，须把它们的显存增量一并计入预算。
-- **最小验证**：同种子对比前向输出、loss 与梯度；记录最坏形状下峰值显存增量及无 Profiler 稳态步长。
+## M2 选定算子或层的选择性激活检查点（SAC） · 已核实改造案例
 
----
+- **Before 信号**。整层 AC 重放昂贵算子，仍有空间保留特定输出；或已有 SAC 保留的输出导致峰值过高。先定位算子的实际后端、重放开销和输出体量。
+- **改法**。在支持非重入 checkpoint 的目标版本，用 `create_selective_checkpoint_contexts` 和 `CheckpointPolicy` 指定需要保存的算子。选择 FFN、Attention 或 GEMM 要基于实际命中和输出成本。SAC 的层段或间隔仅在已有 AC 的层上选择。
+- **前提和回退**。核对非重入 API、算子注册、inplace/别名、编译区边界以及 offload 等互斥配置。策略、context 和有依赖的区域包装或重放状态成组启停。已有 SAC 导致显存压力时先收紧保存范围，必要时退回普通 AC。普通 AC 仍 OOM 时优先评估 M1 扩大覆盖、M3–M5 或 M7。版本不兼容或算子无法捕获时恢复已验证的普通 AC 或原 offload 路径。更改 RNG 保存另做独立对照，检查 dropout、随机深度及其他随机状态。
+- **最小验证**。核对前向与重放实际覆盖的算子，检查梯度、随机行为、分配重试、峰值与反向时间。在 eager、compile 或分布式组合中只验收拟启用的受支持组合。
 
-## M2 选择性激活检查点（SAC）：只存重算最贵的算子 `[已核实改造案例]`
+## M3 缩小训练期隐式 KV cache · 已核实改造案例｜版本兼容性待核对
 
-- **Before 坏味道**：整层 AC 重算代价过大（反复重算昂贵的 Attention 与大矩阵乘 GEMM），而直接关掉整层 AC 又会 OOM。
-- **After 手法**：
-  - 使用 PyTorch 标准 `create_selective_checkpoint_contexts` 与 `CheckpointPolicy`，对重算最贵的算子（如 `aten.mm.default`、`aten.addmm.default`、FlashAttention 前向）返回 `CheckpointPolicy.MUST_SAVE`，对廉价逐元素/归一化/激活算子返回 `CheckpointPolicy.PREFER_RECOMPUTE`。
-  - 可与层间隔/尾部层策略组合（仅对末尾 `sac_layers` 层或按 `sac_layer_interval` 启用 SAC），且仅作用于已开启 AC 的层（未开 AC 的层本就由 autograd 保留激活，禁止二次缓存）。
-  - 确认模型不需要逐层严格复现 dropout RNG 状态时，可将 `preserve_rng_state=False` 减少状态保存开销；涉及跨多个 eager 区域重放时，须维持 checkpoint `func_counter` 位置对齐。
-- **前提与不适用**：
-  - 需核实目标 PyTorch 版本对 `create_selective_checkpoint_contexts` 与自定义算子（如 `flash_attn`）的支持情况（「版本兼容性待核对」）。
-  - 依赖 `use_reentrant=False`（非重入 checkpoint）；旧版 `use_reentrant=True` 与 FSDP/SAC 组合易触发挂起或梯度丢失。
-- **最小验证**：对比全量 AC 与 SAC 的前向/反向梯度数值等价性、峰值显存变化与反向时间下降。
+- **Before 信号**。目标模型的实际训练 prefill 在无历史 cache、有效 `use_cache=True` 时分配 KV cache。核对目标库是否已在梯度检查点开启时主动关掉缓存。
+- **改法**。通过训练专用配置或已确认的训练入口禁用隐式分配。通用包装优先从训练调用端限定作用域，保留显式参数及已有 `past_key_values` 的语义。GR00T 语料包装的实际覆盖面见证据文档。
+- **前提和回退**。检查共享模型的 eval prefill、显式 `None`、预填充及自回归 decode。恢复原有效配置或原包装，核对缓存对象的产出和消费。
+- **最小验证**。证实目标训练路径的 cache 分配变化及 loss/梯度对照；覆盖显式 `True`、已有 cache、eval 省略参数与生成路径。
 
----
+## M4 减少激活副本和切片 storage 滞留 · 已核实改造案例
 
-## M3 关闭训练期隐式 KV Cache `[已核实改造案例]`
+- **Before 信号**。逐段 cast 再 cat 会保留多份转换副本；后续算子若保存小切片用于反向，切片可以继续持有大 storage。
+- **改法**。同 dtype 且算子语义一致时尝试先 cat 后 cast，混合 dtype 路径保留逐段转换。对确实共享大 storage 且需要长时间保留的小切片，评估转换 dtype 后是否仍需显式 clone。仅用连续化时检查它是否实际发生复制。
+- **前提和回退**。大张量仍有其他消费者、原 storage 本就保留到反向或切片接近整张量时，额外 clone 可能抬高峰值。校验布局、精度和别名契约。若替换前向同时装入 compile group，按替换入口回退。
+- **最小验证**。覆盖同 dtype、混合 dtype、动态长度和缩小/扩大切片，核对数值梯度和实际分配、释放时序。
 
-- **Before 坏味道**：HuggingFace Transformers 等 LLM/VLM 骨干在 `config.use_cache` 默认为 `True` 且 `past_key_values is None` 时，训练前向（prefill）会隐式创建并填充 `DynamicCache`，白占显存与分配开销，且与 gradient checkpointing 冲突。
-- **After 手法**：
-  - 在训练配置中显式设 `model.config.use_cache = False`，或在骨干 `forward` 包装层检查：仅当调用方**未显式传入 `use_cache`** 且 **`past_key_values is None`** 时注入 `use_cache=False`。
-- **前提与不适用**：
-  - 绝不可无条件覆写显式传入 `use_cache=True` 或带 `past_key_values` 的自回归生成/推理路径，否则会破坏推理与评估速度。
-- **最小验证**：训练路径确认未构造 `DynamicCache` 且 loss/梯度不变；推理/生成路径传 `use_cache=True` 时仍正常走缓存。
+## M5 裁剪训练路径中未消费的分支 · 已核实改造案例
 
----
+- **Before 信号**。训练入口计算了条件编码、教师 head 等输出，下游 loss、回调或指标在特定路径中从未读取这些输出。
+- **改法**。由调用端明确传递需求，基于实际模型能力和配置决定是否跳过。DreamZero 只在不用首帧 latent 且非 `i2v` 的配置上省略该 pass，MoGe 由深度教师入口协商能力后省略 normal head。
+- **原子性与回退**。将跳算分支、调用标志、解包及消费方成组启停。核对被裁剪分支的 RNG 消耗、状态更新、hook 与集合通信等副作用。保留需要结果或这些副作用的训练变体、eval、推理和辅助 loss 路径。遇到未知配置走完整计算。
+- **最小验证**。用调用次数确认热路径跳算，覆盖原输出仍被消费的配置及完整 eval/推理，检查 loss、梯度和回退。
 
-## M4 压缩中间激活副本与断开切片 `_base` 视图引用 `[已核实改造案例]`
+## M6 缓解 GC 和缓存回收引起的周期尖刺 · 已核实改造案例
 
-- **Before 坏味道**：
-  1. 拼接多个同 dtype 张量后再转 fp32 时，写成 `torch.cat([p.float() for p in parts], dim=1)`，导致先在显存里多分配一组逐段 fp32 副本再拷贝拼接。
-  2. 对超大临时张量做切片 `local = big_tensor[:, start:end]` 后直接传给后续算子并被 autograd 保存用于反向——因为 `local._base` 仍指向整块 `big_tensor` 的底层 storage，整块大显存被迫活到反向结束才能释放。
-- **After 手法**：
-  - **同 dtype 先拼再转**：校验所有分片同 dtype 时改为 `torch.cat(parts, dim=1).float()`，混合 dtype 时回退原逐段转换。
-  - **断开视图滞留**：对需要进入后续长生命周期/反向保存的切片，若 `local._base is not None` 显式执行 `local = local.clone(memory_format=torch.contiguous_format)`（否则仅在非连续时 `.contiguous()`），让上游大张量立刻可被回收。
-- **前提与不适用**：
-  - 仅对**大张量的小切片且上游大张量此后不再使用**的场景合算；若切片几乎等于整张量或上游张量本来就要留到反向，`.clone()` 反而额外增加显存与拷贝。
-- **最小验证**：对比开关前后 `max_memory_allocated` 与数值逐位等价性。
+- **Before 信号**。GC 收集或 `empty_cache()` 的时间与慢 rank、步时尖刺相符。先排除数据等待、异步保存、版本特定分配器行为与通信到达偏斜。源码中的调用位置仅能作为候选。语料已核实 GC 冻结；清缓存频率调整按目标运行证据选用。
+- **改法**。若长寿命对象已稳定且 GC 是主因，核对 CPython 版本、worker 启动方式及恢复训练的时间点，评估在安全点执行 `gc.collect(2)` 和 `gc.freeze()`。需要 barrier 时确认所有 rank 走同一条件和次序。若怀疑清缓存，先区分稳态热路径、profiling、资源卸载和 OOM 恢复，再对实际频率做对照。
+- **前提和回退**。保留常规 GC，监视各 rank 和相关 worker 的主机 RSS。把 checkpoint、profiling、恢复等受保护的同步或清理路径单标，按证据验证。已冻结状态用新进程验证关闭路径。
+- **最小验证**。看 P50/P95/P99/Max、尖刺频率和 GC 事件是否对齐。稳态监测超过原周期，检查 RSS 趋势和长跑稳定性。
 
----
+## M7 分配器配置与碎片 · 已核实配置迁移｜版本兼容性待核对
 
-## M5 裁剪训练期未消费的死分支与冗余状态遍历 `[已核实改造案例]`
-
-- **Before 坏味道**：
-  1. 多模态/教师分支在训练前向里顺带算了多个 head 或编码路径（如首帧条件 VAE 编码、MoGe `normal_head`），但当前训练 loss 从未消费这些输出，白白耗费显存与算力。
-  2. 每步重复对深层模块树调用 `model.train()` / `set_frozen_modules_to_eval_mode()` 触发大量无意义递归遍历。
-- **After 手法**：
-  - 在确认训练 loss 与回调确实不消费对应输出的前提下，增加显式控制标志（如 `encode_y=False`、`_depth_only=True`），仅在训练分支跳过未用计算，保留评估/完整推理分支走原路径。
-  - 对频繁重复的 `train/eval` 模式设置增加带失效钩子的状态缓存（子模块替换或显式切换模式时失效）。
-- **强耦合原子性**：裁剪输出（返回 `None` 或减少返回键）必须与上游调用方解包逻辑成组核对与启停，防止下游在 eval 或特殊配置下解包 `None` 崩溃。
-- **前提与不适用**：严禁在未核实全部训练/评估调用点及辅助 loss 开关时盲目跳过分支。
-- **最小验证**：验证训练前向输出/loss/梯度与基线逐位一致，同时验证 eval/推理路径仍走完整分支不缺失字段。
-
----
-
-## M6 Warmup 后冻结 Python GC，消除多卡周期性抖动 `[已核实改造案例]`
-
-- **Before 坏味道**：Python 周期性触发第 2 代垃圾回收（扫描数万个长期存活的模型/配置/缓存对象），在单卡上造成数百毫秒停顿；在多卡分布式训练中，各 rank 触发 GC 的步号不同步，导致整集群被轮流拖慢，在 Trace 里常伪装成偶发慢 rank 等待。此外，训练循环每步无条件调用 `torch.cuda.empty_cache()` / `gc.collect()` 也会制造同步与分配器抖动。
-- **After 手法**：
-  - 在模型、优化器、DataLoader 初始化及若干 warmup 步（例如 `step >= 50`，对象图已稳定）完成后：多卡先 `dist.barrier()` 对齐，再一次性执行 `gc.collect(2)` 与 `gc.freeze()`，把长生命周期对象移出后续 GC 扫描范围（新产生的短命对象仍由常规 GC 回收）。
-  - 检查并移除热路径中无依据的每步 `torch.cuda.empty_cache()`，如确有碎片清理需求应拉大间隔并验证必要性。
-- **安全防线（必查）**：
-  - 禁止在初始化未完成前过早冻结，也禁止用 `gc.disable()` 彻底关停 GC 而不排查泄漏。
-  - 启用 `gc.freeze()` 后，必须长跑足够步数持续监控**主机 RSS 内存**，确认无单调持续增长（防止循环引用泄漏被掩盖）。
-- **最小验证**：对比开启前后的步长 P50/P95/P99 与最大尖刺步长，并确认多卡步末 RSS 平稳无泄漏。
-
----
-
-## M7 分配器防碎片配置（`expandable_segments`）`[已核实改造案例｜版本兼容性待核对]`
-
-- **Before 坏味道**：显存快照或日志显示 `max_memory_reserved` 远大于 `max_memory_allocated`，或在动态序列长度下因显存碎片频繁触发分配器重试/OOM（即使总已分配显存远未达到卡容）。
-- **After 手法**：
-  - 进程启动前设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（视 PyTorch/ROCm 构建支持情况；部分 HCU/HIP 构建配套设置 `HIP_BUFFER_EXTRA_SIZE=0` 减少额外缓冲预留）。
-- **前提与不适用**：
-  - 属**进程级环境变量**，必须在 `import torch` 与首次显存分配前设置，且受 PyTorch、CUDA/ROCm 驱动与内核版本约束（「版本兼容性待核对」）；开启后若与 CUDA Graphs 或特定驱动不兼容须立即回退。
-- **最小验证**：新进程对比开关前后的 `max_memory_reserved` / `allocated` 差值、分配器 `num_alloc_retries` 与稳态步长。
-
----
-
-## 通用不适用场景
-
-- 瓶颈在通信暴露、DataLoader 饥饿或步内 `.item()` 同步（应先交给对应专项，不要盲目关 AC 冒 OOM 风险）。
-- 尚无任何基线峰值显存数据时，直接关闭全模型 AC。
-- 涉及两阶段离线预编码落盘（如离线生成 VAE latent / text embedding 磁盘库）→ 归数据管线/训练工作流方向。
+- **Before 信号**。动态形状伴随分配重试、OOM 或显存快照出现碎片。用同一时点的 allocated/reserved 和快照判断，两个独立历史峰值的差值只作线索。
+- **改法**。区分是否已由启动脚本设置、实际分配器 backend 和目标构建支持。目标版本适用时，可在启动前试验 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。语料的 LingBot-VA / OpenWAM 是已核实配置迁移。厂商构建中的 `HIP_BUFFER_EXTRA_SIZE` 作为独立的受限配置核对。
+- **前提和回退**。目标后端不支持、出现图捕获不兼容或重试/峰值退化时，恢复原环境并以新进程验证。
+- **最小验证**。固定形状分布和 checkpoint 状态，新进程分别记录峰值、同点分配统计、重试、OOM 和稳态步时。
