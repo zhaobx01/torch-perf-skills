@@ -1,6 +1,6 @@
 # PyTorch 性能优化技能库
 
-这套 Skill 用于分析 PyTorch 训练和推理的性能瓶颈，并在目标项目中实施和验证优化。仓库包含 1 个上游 Trace 诊断 Skill、7 个下游专项优化 Skill，以及面向 `torch.compile` 的分析与实施提示词。
+这套 Skill 用于分析 PyTorch 训练和推理的性能瓶颈，并在目标项目中实施和验证优化。仓库包含 1 个上游 Trace 诊断 Skill 和 7 个下游专项优化 Skill。
 
 ## Skill 目录
 
@@ -31,16 +31,8 @@ python3 trace-triage/scripts/trace_report.py --trace-dir /path/to/traces -o ./tr
 
 输出为 `trace-report/report.md` 和 `trace-report/summary.json`，可先查阅[示例报告](trace-triage/references/sample-report.md)。
 
-### `torch.compile` 分析与实施提示词
-
-1. [训练瓶颈分析提示词](prompts/training_trace_compile_analysis_prompt.md)：用于离线分析，结合 Trace、源码与已有 HTA 数据生成瓶颈报告与编译建议。
-2. [Compile 优化实施与验证提示词](prompts/training_compile_implementation_prompt.md)：用于接入与验证（默认 `max-autotune-no-cudagraphs`，使用前须核实目标 PyTorch 与后端支持）。
-
-提示词优先使用本地 `trace-triage` 与 `opt-compile`；可选外部诊断 Skill（如 `debug-graph-breaks`、`analyze-memory-snapshot`）仅在本地已安装时协同，缺失则按包内规则降级并在报告中注明。
-
 ## 仓库结构
 
 - 根目录下的 8 个 Skill 均以 `SKILL.md` 为入口，配套 `references/`（模式、单份跨模型证据与验证规范）及纯标准库 `scripts/`（离线 Trace 统计或静态候选扫描 + `selftest.py` 自测）。
 - [SKILL_DESIGN_PRINCIPLES.md](SKILL_DESIGN_PRINCIPLES.md)：定义专用性能优化 Skill 的设计规范、双模式契约、语料证据要求与发布自查清单。
-- [prompts/](prompts/)：存放跨 Skill 的端到端分析与实施提示词（唯一维护源）。
 - [.skills-manager/](.skills-manager/)：存放 Skills Manager 的备份元数据。README 中的 Skill 目录以仓库内实际存在的 `SKILL.md` 为准。
