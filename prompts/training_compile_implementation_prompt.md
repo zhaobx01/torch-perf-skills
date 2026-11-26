@@ -1,6 +1,6 @@
 # 实施并验证 Compile 优化
 
-使用 `torch-compile-integration` Skill，根据已有分析报告，以最小、可回退的方式接入并验证 `torch.compile`。遵循 Skill 的实施与验证规范，按需使用相关诊断 Skill；不重复展开已有且仍有效的分析，不扩展到其他优化。
+使用 `opt-compile` Skill，根据已有分析报告，以最小、可回退的方式接入并验证 `torch.compile`。遵循 Skill 的实施与验证规范，按需使用相关诊断 Skill；不重复展开已有且仍有效的分析，不扩展到其他优化。
 
 ## 硬性底线
 
