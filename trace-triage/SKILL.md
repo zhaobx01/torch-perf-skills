@@ -2,7 +2,7 @@
 name: trace-triage
 description: Upstream read-only bottleneck profiler for PyTorch training/inference. Parses multi-rank PyTorch Profiler traces plus optional run records, compile logs, key_averages, and HTA outputs (or optionally runs HTA in an existing Python environment for cross-checking) to quantify GPU time breakdown, idle attribution, sync starvation, H2D/D2H transfers, exposed communication, and a Top-5 recoverable upper-bound ranking, then hands off to downstream optimization skills. Use whenever you have Profiler traces and want to find where GPU time goes or which optimization direction to prioritize; when traces are missing, output the collection checklist only. Do not use to edit project source code, run training/profiling, or design concrete compile/kernel/layout/sync rewrites (hand off to opt-compile, opt-kernel, opt-layout, or opt-sync).
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Trace 瓶颈速览（上游只读诊断入口）
@@ -24,7 +24,7 @@ metadata:
 | key_averages 文本 | 否 | rank 0 的算子表（常在 `train.log`），只作 top 算子交叉校验 |
 | HTA 输出 / 已有 HTA 环境 | 否 | 已有的 `temporal/idle/overlap` CSV，或在用户已有 HTA Python 环境时按 [references/hta-analysis.md](references/hta-analysis.md) 可选运行 HTA 做交叉验证（缺环境则跳过，不安装） |
 
-缺 Trace 时不要编造数字：先读 [references/collection.md](references/collection.md)，把采集清单交给用户，等采集完再统计。
+缺 Trace 时不要编造数字：先读 [references/collection.md](references/collection.md)，把采集清单交给用户，等采集完再统计。若目标项目缺少现成的 profiler 开关，可直接使用或推荐用户安装外部 `profile-model` Skill（经用户授权）按 `collection.md` 的文件命名与窗口约定插桩采集；未安装或离线时按 `collection.md` 手动接入即可，本 Skill 不自动安装外部 Skill 或执行采集。
 
 ## 流程
 

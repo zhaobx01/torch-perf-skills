@@ -8,7 +8,7 @@ description: >-
   graph capture to opt-compile, and collective overlap to
   opt-distributed.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Optimize Memory And Recompute
@@ -45,7 +45,7 @@ metadata:
 
 - **缺显存证据**：暂缓削减 AC 或放宽 SAC。说明最坏序列、完整 batch 和累积窗口缺哪些数据。先核对已有峰值与重试记录，获得授权后再在目标配置下做短步峰值摸底。余量不足时保留原 AC，并评估省显存方向。
 - **缺 GC 或分配器归因**：把冻结、清缓存频率和分配器配置变体列为低优静态候选。给出对齐慢 rank 步号与 GC 事件、清缓存调用和分配重试的最小取证方案，拿到归因后再选型。
-- **缺目标依赖或后端版本**：先查本地；如已有快照且已安装 `analyze-memory-snapshot`，可协同分析。否则按包内峰值、重试与快照取证步骤继续，标注缺口。
+- **缺目标依赖或后端版本**：先查本地；如已有显存快照需深度解析，可使用或推荐用户安装外部 `analyze-memory-snapshot` Skill 协同（本 Skill 不自动安装）。未安装或离线时按包内峰值、重试与快照取证步骤继续，标注缺口。
 - **强耦合与保护路径**：写清原子组的成员、调用契约及启停和回退方式。对防 OOM、保数值、保导出或 checkpoint 一致性的路径单标「正确性保护（非提速）」。
 
 ### 实施
