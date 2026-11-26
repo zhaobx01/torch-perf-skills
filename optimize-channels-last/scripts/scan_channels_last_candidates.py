@@ -7,13 +7,13 @@ that channels_last / channels_last_3d will improve performance. Confirm with a
 profiler trace first.
 
 Detected patterns (all name/AST-based, so false positives are expected):
-  conv2d_subgraph          Per-file summary of nn.Conv2d / nn.ConvTranspose2d sites
-  conv3d_subgraph          Per-file summary of nn.Conv3d / nn.ConvTranspose3d sites
+  conv2d_subgraph          Per-file summary of PyTorch 2D convolution modules and functional calls
+  conv3d_subgraph          Per-file summary of PyTorch 3D convolution modules and functional calls
   rearrange_5d_4d          einops.rearrange switching between 5D and 4D (layout transition boundary)
   permute_nhwc_trap        .permute(0,2,3,1) / (0,2,3,4,1) / (0,3,1,2) (logical axis vs memory_format trap)
   existing_channels_last   Existing channels_last / channels_last_3d / convert_conv*d_weight_memory_format / force_stride_order
-  miopen_suggest_env       References to PYTORCH_MIOPEN_SUGGEST_NHWC / PYTORCH_MIOPEN_SUGGEST_NDHWC
-  optimizer_state_save     optimizer.state_dict() or *save*optimizer_state* in save paths (check contiguous checkpoint)
+  miopen_suggest_env       Python environment access for PYTORCH_MIOPEN_SUGGEST_NHWC / NDHWC
+  optimizer_state_save     Optimizer state_dict() in checkpoint/save paths (check contiguous checkpoint)
 
 Usage:
     python3 scan_channels_last_candidates.py <file-or-dir> [...]
@@ -21,6 +21,8 @@ Usage:
     python3 scan_channels_last_candidates.py --patterns conv3d_subgraph,rearrange_5d_4d <file-or-dir>
 
 Only the Python standard library is used (Python 3.6+ compatible).
+Use an interpreter that can parse the target project. Skipped files are
+reported on stderr, including in JSON mode. This scans Python files only.
 """
 
 import argparse
@@ -29,7 +31,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache"}
 
@@ -72,6 +74,32 @@ _NHWC_PERMUTES = {
 }
 
 _REARRANGE_ARROW = re.compile(r"^(.+?)\s*->\s*(.+?)$")
+_CONV_MODULES = {
+    "Conv2d": 2,
+    "ConvTranspose2d": 2,
+    "Conv3d": 3,
+    "ConvTranspose3d": 3,
+}
+_CONV_FUNCTIONS = {
+    "conv2d": 2,
+    "conv_transpose2d": 2,
+    "conv3d": 3,
+    "conv_transpose3d": 3,
+}
+_LAYOUT_FORMATS = {"torch.channels_last", "torch.channels_last_3d"}
+_LAYOUT_HELPERS = {
+    "torch.nn.utils.convert_conv2d_weight_memory_format",
+    "torch.nn.utils.convert_conv3d_weight_memory_format",
+    "torch.nn.utils.memory_format.convert_conv2d_weight_memory_format",
+    "torch.nn.utils.memory_format.convert_conv3d_weight_memory_format",
+    "torch._inductor.inductor_prims.force_stride_order",
+}
+_MIOPEN_KEYS = {"PYTORCH_MIOPEN_SUGGEST_NHWC", "PYTORCH_MIOPEN_SUGGEST_NDHWC"}
+_ENV_CALLS = {
+    "os.getenv", "os.putenv", "os.unsetenv",
+    "os.environ.get", "os.environ.setdefault", "os.environ.pop",
+}
+_PERMUTE_CALL = re.compile(r"\bpermute\s*\(")
 
 
 class Finding(object):
@@ -173,7 +201,8 @@ class _Visitor(ast.NodeVisitor):
         self.findings = []  # type: List[Finding]
         self.conv2d_lines = []  # type: List[int]
         self.conv3d_lines = []  # type: List[int]
-        self._func_stack = []  # type: List[str]
+        self._imports = [{}]  # type: List[Dict[str, str]]
+        self._save_context = []  # type: List[bool]
         self._emitted_keys = set()  # type: Set[Tuple[int, str]]
 
     def _emit(self, line, pattern, snippet=None):
@@ -186,82 +215,114 @@ class _Visitor(ast.NodeVisitor):
             snippet = self.lines[line - 1].strip() if 0 < line <= len(self.lines) else ""
         self.findings.append(Finding(self.path, line, pattern, snippet, _NOTES[pattern]))
 
+    def _qualified(self, name):
+        root, dot, rest = name.partition(".")
+        for imports in reversed(self._imports):
+            if root in imports:
+                module = imports[root]
+                return module + dot + rest if module else ""
+        return ""
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            root = alias.name.split(".", 1)[0]
+            self._imports[-1][alias.asname or root] = alias.name if alias.asname else root
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            qualified = node.module + "." + alias.name if node.module and not node.level else ""
+            self._imports[-1][alias.asname or alias.name] = qualified
+
+    def _record_conv(self, qualified, line, allow_function=False):
+        module, _, symbol = qualified.rpartition(".")
+        dimension = _CONV_MODULES.get(symbol) if module in ("torch.nn", "torch.nn.modules.conv") else None
+        if dimension is None and allow_function and module in ("torch", "torch.nn.functional"):
+            dimension = _CONV_FUNCTIONS.get(symbol)
+        if dimension == 2:
+            self.conv2d_lines.append(line)
+        elif dimension == 3:
+            self.conv3d_lines.append(line)
+
     def visit_ClassDef(self, node):
-        # type: (ast.ClassDef) -> None
         for base in node.bases:
-            bname = _dotted(base)
-            btail = bname.rsplit(".", 1)[-1]
-            if btail in ("Conv2d", "ConvTranspose2d") and ("nn" in bname or bname == btail):
-                self.conv2d_lines.append(node.lineno)
-            elif btail in ("Conv3d", "ConvTranspose3d") and ("nn" in bname or bname == btail):
-                self.conv3d_lines.append(node.lineno)
+            self._record_conv(self._qualified(_dotted(base)), node.lineno)
+        self._imports.append({})
         self.generic_visit(node)
+        self._imports.pop()
 
     def visit_FunctionDef(self, node):
-        # type: (ast.FunctionDef) -> None
         lname = node.name.lower()
-        if "save" in lname and "optimizer" in lname:
-            self._emit(node.lineno, "optimizer_state_save")
-        self._func_stack.append(lname)
+        arguments = node.args.args + node.args.kwonlyargs + getattr(node.args, "posonlyargs", [])
+        self._imports.append({arg.arg: "" for arg in arguments})
+        takes_save_path = any(arg.arg in ("save_dir", "save_path") for arg in arguments)
+        self._save_context.append("save" in lname or "checkpoint" in lname or takes_save_path)
         self.generic_visit(node)
-        self._func_stack.pop()
+        self._save_context.pop()
+        self._imports.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def _permute_line(self, node):
+        # Python 3.6 can report the first call in a chain for later calls.
+        for line in range(node.args[0].lineno, node.lineno - 1, -1):
+            if _PERMUTE_CALL.search(self.lines[line - 1]):
+                return line
+        return node.args[0].lineno
 
     def visit_Call(self, node):
         # type: (ast.Call) -> None
         name = _dotted(node.func)
         tail = name.rsplit(".", 1)[-1]
+        qualified = self._qualified(name)
 
-        if tail in ("Conv2d", "ConvTranspose2d") and ("nn" in name or name == tail):
-            self.conv2d_lines.append(node.lineno)
-        elif tail in ("Conv3d", "ConvTranspose3d") and ("nn" in name or name == tail):
-            self.conv3d_lines.append(node.lineno)
-        elif tail == "rearrange":
+        self._record_conv(qualified, node.lineno, allow_function=True)
+        if qualified in ("einops.rearrange", "einops.einops.rearrange"):
             spec = _str_const(node.args[1]) if len(node.args) >= 2 else None
             if _is_5d_4d_rearrange(spec):
                 self._emit(node.lineno, "rearrange_5d_4d")
         elif tail == "permute":
             tup = _extract_permute_tuple(node.args)
             if tup in _NHWC_PERMUTES:
-                self._emit(node.lineno, "permute_nhwc_trap")
-        elif tail in (
-            "convert_conv2d_weight_memory_format",
-            "convert_conv3d_weight_memory_format",
-            "force_stride_order",
-        ):
+                self._emit(self._permute_line(node), "permute_nhwc_trap")
+        elif qualified in _LAYOUT_HELPERS:
             self._emit(node.lineno, "existing_channels_last")
-        elif tail == "state_dict":
-            in_save_fn = any("save" in fn or "checkpoint" in fn for fn in self._func_stack)
-            if in_save_fn and "optim" in name.lower():
-                self._emit(node.lineno, "optimizer_state_save")
-
-        # Check string arguments for MIOpen suggest env vars
-        for arg in node.args:
-            sval = _str_const(arg)
-            if sval in ("PYTORCH_MIOPEN_SUGGEST_NHWC", "PYTORCH_MIOPEN_SUGGEST_NDHWC"):
-                self._emit(node.lineno, "miopen_suggest_env")
-        for kw in node.keywords:
-            sval = _str_const(kw.value)
-            if sval in ("PYTORCH_MIOPEN_SUGGEST_NHWC", "PYTORCH_MIOPEN_SUGGEST_NDHWC"):
+        elif tail == "state_dict" and any(self._save_context) and "optim" in name.lower():
+            self._emit(node.lineno, "optimizer_state_save")
+        elif qualified in _ENV_CALLS:
+            key = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "key"), None
+            )
+            if _str_const(key) in _MIOPEN_KEYS:
                 self._emit(node.lineno, "miopen_suggest_env")
 
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        if self._qualified(_dotted(node.value)) == "os.environ":
+            key = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
+            if _str_const(key) in _MIOPEN_KEYS:
+                self._emit(node.lineno, "miopen_suggest_env")
         self.generic_visit(node)
 
     def visit_Attribute(self, node):
-        # type: (ast.Attribute) -> None
-        if node.attr in ("channels_last", "channels_last_3d"):
+        if self._qualified(_dotted(node)) in _LAYOUT_FORMATS:
             self._emit(node.lineno, "existing_channels_last")
         self.generic_visit(node)
 
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and self._qualified(node.id) in _LAYOUT_FORMATS:
+            self._emit(node.lineno, "existing_channels_last")
+
 
 def scan_file(path, allowed_patterns=None):
-    # type: (str, Optional[Set[str]]) -> List[Finding]
+    # type: (str, Optional[Set[str]]) -> Optional[List[Finding]]
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
         tree = ast.parse(source, filename=path)
     except (OSError, SyntaxError) as exc:
         print("warning: skipped {}: {}".format(path, exc), file=sys.stderr)
-        return []
+        return None
     lines = source.splitlines()
     visitor = _Visitor(path, lines)
     visitor.visit(tree)
@@ -287,13 +348,12 @@ def scan_file(path, allowed_patterns=None):
     return findings
 
 
-def _iter_files(paths):
-    # type: (Iterable[str]) -> Iterable[str]
+def _iter_files(paths, on_error):
     for path in paths:
         if os.path.isfile(path) and path.endswith(".py"):
             yield path
         elif os.path.isdir(path):
-            for root, dirs, names in os.walk(path):
+            for root, dirs, names in os.walk(path, onerror=on_error):
                 dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
                 for name in sorted(names):
                     if name.endswith(".py"):
@@ -311,6 +371,9 @@ def main(argv=None):
         help="Comma-separated subset of pattern names to report (default: all).",
     )
     args = parser.parse_args(argv)
+    for path in args.paths:
+        if not (os.path.isdir(path) or (os.path.isfile(path) and path.endswith(".py"))):
+            parser.error("expected an existing Python file or directory: {}".format(path))
 
     allowed = None  # type: Optional[Set[str]]
     if args.patterns.strip():
@@ -323,14 +386,34 @@ def main(argv=None):
         allowed = set(requested)
 
     findings = []  # type: List[Finding]
-    for path in _iter_files(args.paths):
-        findings.extend(scan_file(path, allowed_patterns=allowed))
+    scanned = 0
+    skipped = 0
+
+    def walk_error(error):
+        nonlocal skipped
+        skipped += 1
+        print("warning: skipped {}".format(error), file=sys.stderr)
+
+    for path in _iter_files(args.paths, walk_error):
+        result = scan_file(path, allowed_patterns=allowed)
+        if result is None:
+            skipped += 1
+        else:
+            scanned += 1
+            findings.extend(result)
     findings.sort(key=lambda f: (f.file, f.line, f.pattern))
+
+    if skipped or not scanned:
+        print("Scanned {} Python file(s); {} skipped.".format(scanned, skipped), file=sys.stderr)
+    print(
+        "STATIC candidates only: they do not prove convolutions are hot or that channels-last "
+        "will speed up this model. Confirm with a profiler first.",
+        file=sys.stderr,
+    )
 
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2))
-        return 0
-    if not findings:
+    elif not findings:
         print("No candidates found.")
     else:
         counts = {}  # type: Dict[str, int]
@@ -345,12 +428,7 @@ def main(argv=None):
             print("{}:{}  [{}]".format(f.file, f.line, f.pattern))
             print("    {}".format(f.snippet))
             print("    note: {}\n".format(f.note))
-    print(
-        "STATIC candidates only: they do not prove convolutions are hot or that channels-last "
-        "will speed up this model. Confirm with a profiler first.",
-        file=sys.stderr,
-    )
-    return 0
+    return 1 if skipped and not scanned else 0
 
 
 if __name__ == "__main__":

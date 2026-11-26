@@ -19,6 +19,8 @@ SYNTHETIC_SAMPLE = """
 import os
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+from torch.nn.functional import conv2d as point_conv
 from einops import rearrange
 
 # Multiple Conv2d / Conv3d sites (including Conv3d subclass) collapse to 1 summary each
@@ -29,6 +31,9 @@ c2a = nn.Conv2d(3, 16, 3)
 c2b = nn.ConvTranspose2d(16, 3, 3)
 c3a = nn.Conv3d(3, 16, 3)
 c3b = nn.ConvTranspose3d(16, 3, 3)
+c2_function = point_conv(x, weight)
+c3_function = F.conv3d(x, weight)
+c3_other = third_party.conv3d(x, weight)
 
 # 5D <-> 4D rearrange (positive) vs 3D rearrange (negative)
 y4 = rearrange(x5, "b c t h w -> (b t) c h w")
@@ -36,12 +41,22 @@ y5 = rearrange(y4, "(b t) c h w -> b c t h w", t=4)
 y3 = rearrange(tokens, "b n d -> b d n")
 
 # Logical NHWC permute (positive) vs attention head permute (negative)
-nhwc = x.permute(0, 2, 3, 1)
+nhwc = (
+    x.permute(1, 0, 2)
+    .view(batch, height, width, -1)
+    .permute(0, 2, 3, 1)
+)
 attn = q.permute(0, 2, 1, 3)
 
 # Existing channels_last & MIOpen env var
 m = c2a.to(memory_format=torch.channels_last)
 os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+os.environ["PYTORCH_MIOPEN_SUGGEST_NDHWC"] = "0"
+logger.info("PYTORCH_MIOPEN_SUGGEST_NDHWC")
+profile.channels_last = False
+
+def save_optimizer_settings(settings):
+    return settings
 
 # Optimizer checkpoint save (positive) vs non-save state_dict (negative)
 def save_checkpoint(optimizer, path):
@@ -58,7 +73,7 @@ EXPECTED_COUNTS = {
     "rearrange_5d_4d": 2,
     "permute_nhwc_trap": 1,
     "existing_channels_last": 1,
-    "miopen_suggest_env": 1,
+    "miopen_suggest_env": 2,
     "optimizer_state_save": 1,
 }
 
@@ -93,7 +108,12 @@ def main():
         assert counts == EXPECTED_COUNTS, "Expected {}, got {}".format(EXPECTED_COUNTS, counts)
 
         c2 = [x for x in findings if x["pattern"] == "conv2d_subgraph"][0]
-        assert "2 Conv2d/ConvTranspose2d site(s)" in c2["snippet"], c2
+        assert "3 Conv2d/ConvTranspose2d site(s)" in c2["snippet"], c2
+        c3 = [x for x in findings if x["pattern"] == "conv3d_subgraph"][0]
+        assert "4 Conv3d/ConvTranspose3d site(s)" in c3["snippet"], c3
+        permute = [x for x in findings if x["pattern"] == "permute_nhwc_trap"][0]
+        assert permute["snippet"] == ".permute(0, 2, 3, 1)", permute
+        assert "STATIC candidates only" in res_json.stderr, res_json.stderr
 
         # 2. Text mode + --patterns filter + static disclaimer on stderr
         res_text = _run(["--patterns", "rearrange_5d_4d,permute_nhwc_trap", sample_path])
@@ -102,6 +122,26 @@ def main():
 
         # 3. Unknown pattern must exit non-zero
         _run(["--patterns", "nonexistent_pattern", sample_path], expect_ok=False)
+
+        # 4. Distinguish an invalid path, a partial scan, and an empty successful scan.
+        missing = sample_path + ".missing.py"
+        bad = _run(["--json", missing], expect_ok=False)
+        assert missing in bad.stderr, bad.stderr
+
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = os.path.join(directory, "invalid.py")
+            empty = os.path.join(directory, "empty.py")
+            with open(invalid, "w") as file:
+                file.write("def broken(\n")
+            with open(empty, "w") as file:
+                file.write("# valid file with no findings\n")
+            partial = _run(["--json", directory])
+            assert json.loads(partial.stdout) == [], partial.stdout
+            assert "1 skipped" in partial.stderr and invalid in partial.stderr, partial.stderr
+            unreadable = _run(["--json", invalid], expect_ok=False)
+            assert invalid in unreadable.stderr, unreadable.stderr
+            clean = _run(["--json", empty])
+            assert json.loads(clean.stdout) == [] and "skipped" not in clean.stderr, clean.stderr
 
         print("selftest PASSED: {} patterns verified, per-file summary & false-positive boundaries OK.".format(
             len(EXPECTED_COUNTS)
