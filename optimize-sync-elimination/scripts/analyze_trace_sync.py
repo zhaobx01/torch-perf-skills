@@ -6,8 +6,8 @@ This script only PARSES an existing Chrome-trace JSON file produced by
 your model, does not attach a profiler, and does not capture anything.
 
 Note on scope:
-- It matches event names and sums their CPU/event durations; it does NOT
-  cross-check whether the GPU track was actually idle during each call.
+- It sums durations of matching events, including GPU copy events. Durations
+  can overlap, so the sum does NOT measure wall time or GPU idle time.
   When you have full multi-rank traces, prefer ``trace-bottleneck-report``
   (§4 GPU starvation attribution) to judge real sync cost.
 - HIP/DTK event naming varies by build and is NOT verified across all DTK
@@ -25,20 +25,28 @@ Only the Python standard library is used (compatible with Python 3.6+).
 import argparse
 import gzip
 import json
+import math
 import re
 import sys
+import zlib
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 
+_ATEN_OVERLOAD = r"(?:\.[A-Za-z_]\w*)?\Z"
+
 # (label, compiled regex). Matched against the raw event "name" field.
 _SYNC_PATTERNS = [
-    ("explicit_synchronize", re.compile(r"(cuda|hip)(Device|Stream|Event)?Synchronize", re.IGNORECASE)),
-    ("memcpy_d2h_or_h2d", re.compile(r"Memcpy\s*(DtoH|HtoD|D2H|H2D)", re.IGNORECASE)),
-    ("memcpy_async_api", re.compile(r"(cuda|hip)MemcpyAsync", re.IGNORECASE)),
-    ("item_or_local_scalar", re.compile(r"aten::(item|_local_scalar_dense)")),
-    ("nonzero_or_dynamic_shape", re.compile(r"aten::(nonzero|argwhere|masked_select|_unique2|unique_dim|unique_consecutive)")),
-    ("index_ops", re.compile(r"aten::(index|index_select|index_put)\b")),
+    ("explicit_synchronize", re.compile(r"\b(?:cuda|hip)(?:Device|Stream|Event)?Synchronize\b", re.IGNORECASE)),
+    ("memcpy_d2h_or_h2d", re.compile(r"\bMemcpy\s*(DtoH|HtoD|D2H|H2D)\b", re.IGNORECASE)),
+    ("memcpy_async_api", re.compile(r"\b(?:cuda|hip)Memcpy(?:Async|WithStream)\b", re.IGNORECASE)),
+    ("memcpy_sync_api", re.compile(r"\b(?:cuda|hip)Memcpy\b", re.IGNORECASE)),
+    ("item_or_local_scalar", re.compile(r"^aten::(?:item|_local_scalar_dense)" + _ATEN_OVERLOAD)),
+    ("nonzero_or_dynamic_shape", re.compile(
+        r"^aten::(?:nonzero|argwhere|masked_select|_unique2|unique_dim"
+        r"|unique_consecutive|unique_dim_consecutive)" + _ATEN_OVERLOAD
+    )),
+    ("index_ops", re.compile(r"^aten::(?:index|index_select|index_put|index_put_)" + _ATEN_OVERLOAD)),
 ]
 
 
@@ -49,28 +57,48 @@ class Aggregate(object):
         self.total_dur_us = 0.0
         self.sample_names: Set[str] = set()
         self.sample_stacks: List[str] = []
+        self.by_direction: Dict[str, Aggregate] = {}
 
     def to_dict(self) -> Dict[str, object]:
-        return {
+        row = {
             "label": self.label,
             "count": self.count,
             "total_dur_us": self.total_dur_us,
             "sample_names": sorted(self.sample_names),
             "sample_stacks": self.sample_stacks,
         }
+        if self.by_direction:
+            row["direction_breakdown"] = {
+                direction: {"count": bucket.count, "total_dur_us": bucket.total_dur_us}
+                for direction, bucket in sorted(self.by_direction.items())
+            }
+        return row
 
 
 def _load_events(path: str) -> List[dict]:
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
         data = json.load(handle)
-    if isinstance(data, dict):
-        events = data.get("traceEvents", [])
-    elif isinstance(data, list):
-        events = data
-    else:
-        events = []
-    return [e for e in events if isinstance(e, dict)]
+    events = data.get("traceEvents") if isinstance(data, dict) else data
+    if not isinstance(events, list):
+        raise ValueError("expected a traceEvents array or a top-level event array")
+    return [event for event in events if isinstance(event, dict)]
+
+
+def _duration_events(events: List[dict]):
+    for event in events:
+        name, duration = event.get("name"), event.get("dur")
+        # "X" is a complete event; some traces omit the phase.
+        if not isinstance(name, str) or event.get("ph") not in (None, "X"):
+            continue
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 0:
+            continue
+        try:
+            duration = float(duration)
+        except OverflowError:
+            continue
+        if math.isfinite(duration):
+            yield event, name, duration
 
 
 def _extract_stack(event: dict) -> Optional[str]:
@@ -86,38 +114,35 @@ def _extract_stack(event: dict) -> Optional[str]:
 
 def analyze(events: List[dict]) -> Dict[str, Aggregate]:
     aggregates: Dict[str, Aggregate] = {}
-    for event in events:
-        name = event.get("name")
-        if not isinstance(name, str):
-            continue
-        if event.get("ph") not in (None, "X"):
-            # "X" = complete event with duration; some traces omit ph.
-            continue
+    for event, name, duration in _duration_events(events):
         for label, pattern in _SYNC_PATTERNS:
-            if pattern.search(name):
-                agg = aggregates.setdefault(label, Aggregate(label=label))
-                agg.count += 1
-                dur = event.get("dur")
-                if isinstance(dur, (int, float)):
-                    agg.total_dur_us += float(dur)
-                agg.sample_names.add(name)
-                stack = _extract_stack(event)
-                if stack and stack not in agg.sample_stacks and len(agg.sample_stacks) < 5:
-                    agg.sample_stacks.append(stack)
-                break
+            match = pattern.search(name)
+            if not match:
+                continue
+            if label not in aggregates:
+                aggregates[label] = Aggregate(label)
+            agg = aggregates[label]
+            agg.count += 1
+            agg.total_dur_us += duration
+            agg.sample_names.add(name)
+            if label == "memcpy_d2h_or_h2d":
+                direction = "D2H" if match.group(1).lower() in ("dtoh", "d2h") else "H2D"
+                if direction not in agg.by_direction:
+                    agg.by_direction[direction] = Aggregate(direction)
+                bucket = agg.by_direction[direction]
+                bucket.count += 1
+                bucket.total_dur_us += duration
+            stack = _extract_stack(event)
+            if stack and stack not in agg.sample_stacks and len(agg.sample_stacks) < 5:
+                agg.sample_stacks.append(stack)
+            break
     return aggregates
 
 
 def list_all_names(events: List[dict]) -> List[Tuple[str, int, float]]:
     totals: Dict[str, List[float]] = defaultdict(list)
-    for event in events:
-        name = event.get("name")
-        if not isinstance(name, str):
-            continue
-        if event.get("ph") not in (None, "X"):
-            continue
-        dur = event.get("dur")
-        totals[name].append(float(dur) if isinstance(dur, (int, float)) else 0.0)
+    for _, name, duration in _duration_events(events):
+        totals[name].append(duration)
     rows = [(name, len(durs), sum(durs)) for name, durs in totals.items()]
     rows.sort(key=lambda row: (-row[2], row[0]))
     return rows
@@ -137,7 +162,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         events = _load_events(args.trace)
-    except (OSError, ValueError) as exc:
+    except (OSError, EOFError, ValueError, zlib.error) as exc:
         print("error: could not read trace: %s" % exc, file=sys.stderr)
         return 1
 
@@ -173,6 +198,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Sync-related events found (sorted by total duration):\n")
         for agg in ordered:
             print("[%s] count=%d total_dur=%.1fus" % (agg.label, agg.count, agg.total_dur_us))
+            for direction, bucket in sorted(agg.by_direction.items()):
+                print("    %s count=%d total_dur=%.1fus" % (direction, bucket.count, bucket.total_dur_us))
+            if agg.label in ("memcpy_async_api", "memcpy_sync_api"):
+                print("    direction unknown from API name")
             print("    matched names: %s" % ", ".join(sorted(agg.sample_names)))
             for stack in agg.sample_stacks:
                 first_line = stack.splitlines()[0] if stack else ""
@@ -180,8 +209,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print()
 
     print(
-        "Note: this matches event NAMES and sums event durations without checking whether the GPU "
-        "track was idle. Use trace-bottleneck-report for GPU starvation attribution, and run "
+        "Note: this sums matching event durations, which can overlap and include GPU copy events. "
+        "Use trace-bottleneck-report for GPU starvation attribution, and run "
         "--list-names on unfamiliar HIP/DTK traces to verify actual event names.",
         file=sys.stderr,
     )

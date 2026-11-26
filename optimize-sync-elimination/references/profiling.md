@@ -1,6 +1,6 @@
 # Trace 中的同步证据
 
-本文说明如何从已采集的 PyTorch Profiler Trace（Chrome trace JSON / `.json.gz`）中核实同步是否真实发生以及是否真正造成 GPU 饥饿。本 Skill **不替用户启动训练或采集 Trace**；若尚无 Trace，请按缺证据降级协议给出最小采集建议，待用户授权或自行采集后再分析。
+本文说明如何从已采集的 PyTorch Profiler Trace（Chrome trace JSON / `.json.gz`）中核实同步是否真实发生以及是否真正造成 GPU 饥饿。已有 Trace 可直接离线解析。缺少 Trace 时先查版本和源码，写清最小采集方案与取证后的决策分支。启动训练或补采 Trace 须在本轮授权范围内。
 
 ---
 
@@ -9,7 +9,7 @@
 | 场景 | 推荐工具 | 原因与边界 |
 | --- | --- | --- |
 | 已有完整多 rank Trace、需要判断同步是否真的导致 **GPU 饥饿** 及可回收上限 | 同仓库 `trace-bottleneck-report`（§4 同步与 GPU 饥饿表） | 按“同步调用窗口内设备是否空闲”判定真实代价，避免把 GPU 满载时的 `.item()` 误判成瓶颈 |
-| 只有单份 Trace 需要快速检索同步事件、聚合 Python 调用栈，或在 HIP/DTK 上摸排实际事件命名 | 本 Skill 的 [scripts/analyze_trace_sync.py](../scripts/analyze_trace_sync.py) | 轻量、纯标准库、支持 `--list-names`；**只统计事件名与 CPU 侧耗时，不自动检查 GPU 轨道空闲** |
+| 只有单份 Trace 需要快速检索同步事件、聚合 Python 调用栈，或在 HIP/DTK 上摸排实际事件命名 | 本 Skill 的 [scripts/analyze_trace_sync.py](../scripts/analyze_trace_sync.py) | 轻量、纯标准库、支持 `--list-names`；**统计匹配事件次数和时长之和，含 GPU 拷贝轨道，GPU 空闲需另查** |
 | 尚无 Trace，只想先在源码里筛可疑点 | 本 Skill 的 [scripts/scan_sync_points.py](../scripts/scan_sync_points.py) | **仅产出 `[静态]` 候选**，不能证明代码路径会执行或运行时会同步 |
 
 ---
@@ -21,9 +21,9 @@
 | 关注类别 | CUDA 典型事件名 | ROCm / HIP 常见事件名（版本兼容性待核对） |
 | --- | --- | --- |
 | 显式同步 | `cudaDeviceSynchronize`、`cudaStreamSynchronize`、`cudaEventSynchronize` | `hipDeviceSynchronize`、`hipStreamSynchronize`、`hipEventSynchronize` |
-| D2H / H2D 拷贝 | `Memcpy DtoH`、`Memcpy HtoD`、`cudaMemcpyAsync` | `Memcpy DtoH`、`Memcpy HtoD`、`hipMemcpyAsync`（部分构建沿用 CUDA 分类名） |
+| D2H / H2D 拷贝 | `Memcpy DtoH`、`Memcpy HtoD`、`cudaMemcpy`、`cudaMemcpyAsync` | `Memcpy DtoH`、`Memcpy HtoD`、`hipMemcpy`、`hipMemcpyAsync`、`hipMemcpyWithStream`（部分构建沿用 CUDA 分类名） |
 | Python 标量读回 | `aten::item`、`aten::_local_scalar_dense` | 同名（ATen 层不区分后端） |
-| 动态形状与去重 | `aten::nonzero`、`aten::masked_select`、`aten::index`、`aten::_unique2` / `aten::unique_dim` | 同名 |
+| 动态形状与去重 | `aten::nonzero`、`aten::masked_select`、`aten::index` / `aten::index_put_`、`aten::_unique2` / `aten::unique_dim` | 同名 |
 
 ```bash
 # 第一步：摸排真实事件名（尤其在 HIP/DTK 环境）
@@ -36,11 +36,15 @@ python3 scripts/analyze_trace_sync.py trace.json.gz --json
 
 ---
 
+`total_dur_us` 是匹配事件的微秒数之和。父子调用与多 stream 可能重叠，例如 `aten::item` 和内部 `aten::_local_scalar_dense` 可同时计入。使用 `trace-bottleneck-report` 或轨道对齐计算 GPU 空闲与关键路径。汇总只统计具有有效非负时长的完整事件。`--list-names` 可发现未进入预设分类的事件名。
+
+JSON 继续保留 `memcpy_d2h_or_h2d` 及原有合计字段。`direction_breakdown` 按已出现的 `D2H`、`H2D` 给出次数与时长，方向加总等于这一分类的合计。方向未知的异步 runtime 拷贝（`cudaMemcpyAsync` / `hipMemcpyAsync` / `hipMemcpyWithStream`）归入 `memcpy_async_api`，同步 runtime 拷贝（`cudaMemcpy` / `hipMemcpy`）归入 `memcpy_sync_api`。人工关联拷贝轨道时注意 runtime API 与 GPU 拷贝可能描述同一传输。
+
 ## 3. 判定某次同步是否真的造成“GPU 饥饿”
 
 **不要单看 CPU 侧 `aten::item` 耗时下结论**，按 4 步交叉确认：
 
-1. **定位 CPU 同步区间**：在 CPU 线程找到 `aten::item` / `Memcpy DtoH` / `*Synchronize` 的起止时间与调用栈（需采集时开启 `with_stack=True`；带栈 Trace 仅用于定位代码行，不用于对比绝对 step 耗时）。
+1. **定位 CPU 同步区间**：在 CPU 线程找到 `aten::item`、拷贝 runtime API 或 `*Synchronize` 的起止与调用栈，沿相关 ID 或时间窗口对齐 GPU 拷贝轨道的 `Memcpy DtoH`（需采集时开启 `with_stack=True`；带栈 Trace 仅用于定位代码行，不用于对比绝对 step 耗时）。
 2. **核对同期 GPU 轨道**：查看同一时间窗内设备 stream 轨道是否为空白。
    - 若同步期间 GPU 持续满载（例如 ≥90% 在跑真实计算/通信），说明 CPU 只是正常等待已有工作完成，**不是同步消除的高优目标**。
    - 若 GPU 在同步结束前就已排空并出现持续空白，直到同步返回后 CPU 才发出下一批 kernel launch，则属于真实的**同步饥饿**。

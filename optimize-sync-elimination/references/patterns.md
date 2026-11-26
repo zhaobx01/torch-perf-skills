@@ -1,126 +1,70 @@
 # 同步消除模式（P1–P8）
 
-以下模式按 **Before 坏味道 → After 手法 → 前提与不适用 → 最小验证** 组织。所有标记为 `[已核实改造案例]` 的条目均已对照 TurboPhysAI 16 模型快照的 Before 基线与 After 实现源码核实（索引见 [turbophysai-sync-evidence.md](turbophysai-sync-evidence.md)），不含未复测的性能承诺。
+先定位张量设备、调用频率和上下游契约，再选改法。证据标签描述各案例的源码核实程度。运行时命中、设备等价与收益按 [validation.md](validation.md) 验证。来源和原始提交见 [TurboPhysAI 同步证据](turbophysai-sync-evidence.md)。
 
----
+## P1 标量计算与选择留在设备上
 
-## P1 标量计算与分支留在设备上 `[已核实改造案例]`
+- **Before**。热路径把设备张量转为 Python 标量，只用于下一个张量算子或简单条件选择。也可能经过框架 getter 间接读回，或把读出的标量再构建为设备张量。
+- **After**。用零维张量传递值，保留与原路径一致的梯度边界。原 `.item()` 切断标量梯度时，以 `.detach()` 保持该契约。DiT4DiT 的 scheduler sigma 用同设备同 dtype 的张量直接参与计算，先核对 scheduler 的 `sigmas` 实际所在设备。
+- **前提与反例**。核对 AMP 下 dtype、标量精度和梯度。`where` 接收已算好的分支值，改写前查清分支副作用、异常和原先跳过的计算。掩蔽位置可能含 NaN/Inf 时使用满足语义的选择，掩码乘法会传播 NaN。即时中止、跳步和 checkpoint 判定中的同步属于「正确性保护（非提速）」。
+- **最小验证**。同输入比较输出、dtype 和梯度，覆盖空选择和非有限值，用运行时证据确认目标读回减少。
+- **证据状态**。MapTRv2 loss 归一化和布尔 mask 冗余清洗、DiT4DiT scheduler sigma 为「已核实改造案例」。OpenWAM 的私有 `_global_grad_norm` 为「已核实改造案例」「受限/单框架参考」「版本兼容性待核对」。只有确认为 ZeRO-2 已完成裁剪、无 CPU offload 且存在同设备单元素张量时才读私有字段，其他情况走公开 API。
 
-- **Before 坏味道**：对设备张量调用 `.item()`、`int(x)`、`float(x)`、`bool(x)`、`if tensor:` 读回 Python 侧，仅为了传给下一个张量运算（如 loss 归一化因子、clamp 下限）、做简单条件选择，或通过框架 getter 隐式触发 `.item()`（如读取已算好的 `grad_norm`）。
-- **After 手法**：
-  - 下游只需张量运算输入时，保留零维设备张量，用 `.reshape(())` 或 `.detach()` 替代 `.item()`。
-  - 条件分支改为设备端 `torch.where`、`clamp`、掩码乘法；对本身不可能含 NaN/Inf 的 `torch.bool` 张量，直接删除冗余的 `nan_to_num`（尤其旧版本 `.cpu().numpy()` 路径）。
-  - 框架内部已有设备端标量属性（如 DeepSpeed ZeRO-2 的 `_global_grad_norm`）且契约可核实时，直接读取设备张量避免 getter 内部的 `.item()`。
-- **前提与不适用**：
-  - 确认下游算子接受零维张量且不改变混合精度 dtype 提升规则。
-  - **正确性保护（非提速）**：若该标量用于即时决定是否中止训练、跳过 NaN 步或触发 checkpoint，消除同步会延迟错误暴露，必须明确标注权衡而非默认删掉。
-- **最小验证**：同输入/随机态下前后数值与 dtype 一致；grep 或 Trace 确认目标 `.item()` 消失。
+## P2 从源头保留 CPU 元数据，批量转换或从形状推导
 
----
+- **Before**。CPU 来源的尺寸或长度上卡后在步内被读回。位置编码在 Python 循环零散提取设备标量。布局固定时也可能从设备 mask 做 reduce + `.item()` 计算本可推导的计数。
+- **After**。在搬运入口保留符合条件的元数据，其他输入透传原路径。CPU 消费多项小元数据时按字段批量搬运，再构造设备结果。可由原布局证明的计数直接用 shape 和宿主整数计算。Qwen 元数据缓存优先缓存几何、索引和插值权重，保留可训练 embedding 的每步查表。
+- **前提与反例**。核对体量、无反向依赖及设备往返成本。缓存键纳入受影响的形状、设备、dtype 和模型配置，限制容量，按 tracing/export 与模型生命周期处理缓存。在构键时仍从设备取值的实现，即使命中也可能有 D2H。在编译区域用局部 eager 边界时与编译专项协作。
+- **最小验证**。测 CPU 来源与透传、冷/热/淘汰、图像/视频/纯文本分支以及特殊帧数。对缓存构键也计数和追踪拷贝。
+- **证据状态**。Cosmos3 搬运入口、OpenWAM CPU 文本长度、GR00T 和 LingBot-VLA-V2 的不同位置编码做法、DiT4DiT 的 `cond_count` 为「已核实改造案例」。保留版本、硬件和各缓存实现的差异。
 
-## P2 CPU 元数据留在 CPU，或一次性转 CPU 并缓存 `[已核实改造案例]`
+## P3 动态形状与冗余去重
 
-- **Before 坏味道**：
-  1. 本就来自 CPU 的小整数/尺寸元数据（如 `image_size`、文本有效长度）随 batch 整包 `.to(device)` 上卡，前向里又被 `.item()`/`.tolist()` 读回。
-  2. 多模态位置编码/网格元数据（如 `grid_thw`、`input_ids`、`attention_mask`）在 GPU 上进入 Python `for` 循环，每轮把 GPU 标量传给 `torch.linspace`/`torch.arange`/`.item()`，引发数十至数百次逐标量 D2H。
-- **After 手法**：
-  - **源头留在 CPU**：在 batch 搬运边界精确拦截该字段保留在 CPU，其余字段正常上卡；不满足拦截条件时原样透传给原实现。
-  - **一次性批量转 CPU + 缓存**：入口处一次性 `.detach().to("cpu").tolist()`，在 CPU 侧完成全部索引/模板构造，最后将结果张量一次性 `.to(device)`；对重复出现的形状组合按 `(grid_key, device, dtype)` 做有界缓存（如上限 16/64 条，满则清理防显存/内存泄漏）；若外层处于 `torch.compile` 区域内，对查表辅助函数加 `@torch._dynamo.disable` 隔离。
-- **前提与不适用**：
-  - 仅适用于体量小、不参与反向求导的索引/几何/尺寸元数据；大张量往返 CPU 反而引入更高拷贝与 CPU 算力开销。
-  - 缓存必须检查 `not torch.jit.is_tracing()` 及设备/dtype 一致性，禁止缓存带梯度的张量。
-- **最小验证**：覆盖未命中拦截条件、缓存命中/未命中、多图/视频/纯文本单模态分支，确认输出索引与原实现逐位一致。
+- **Before**。布尔抽取或更新、`nonzero` 及 `unique` 可能引入数据相关尺寸和读回。已经唯一且次序满足下游的索引仍执行去重。
+- **After**。在结果形状固定的更新中使用有等价语义的 `torch.where` 或算术。必须抽取元素时，评估显式 `nonzero` + `index_select`、或固定容量加有效 mask。前者仍可能在 `nonzero` 同步。只有证明唯一性和排序语义后才删去 `unique()`。
+- **前提与反例**。确认 mask dtype、写入语义及梯度。固定容量覆盖溢出处理，还要实测额外计算。任意整数索引和普通设备端选择只按各自调用链判断。
+- **最小验证**。全 0、全 1、单元素、空结果与梯度。分别查目标读写和仍保留的动态算子。
+- **证据状态**。BEVFusion `QuickCumsum` 的索引与更新改写、PointPillars 删除冗余去重为「已核实改造案例」。
 
----
+## P4 Attention 封装内的变长元数据与守卫
 
-## P3 动态形状同步与冗余去重（布尔索引 / `nonzero` / `.unique()`）`[已核实改造案例]`
+- **Before → After**。对于已经核对过的封装调用链，可在前提成立时绕开重复的 unpad/变长元数据，或缓存后直传 `cu_seqlens`、`chunk_lengths`。FA2 dense/varlen 选择由主要症状决定主导 Skill，见入口分流。
+- **前提与反例**。明确 backend、prefill/decode、cache、padding 方向和 mask 布局。只有调用方已保证 mask 连续、有效 token 和 padding 输出语义均可接受时，首列检查才可作为其中一个守卫。版本或前提无法确认时回到原路径。记录守卫、缓存构键与回退残留的同步。
+- **最小验证**。测右 padding、左 padding、含洞 mask、decode/cache、不同后端，并逐支记录运行时命中、输出和梯度。缓存要分开核对冷/热和 tracing 路径。
+- **证据状态**。Cosmos3 Qwen 视觉辅助量缓存为「已核实改造案例」，其中 HCU 的 HF 实例包装属于「受限/单模型参考」「版本兼容性待核对」。OpenVLA 的 FA2 prefill 包装属于「实现参考，基线待核实」「版本兼容性待核对」。
 
-- **Before 坏味道**：
-  1. `x[bool_mask]` 布尔掩码索引或依赖 `nonzero()` 输出长度动态分配缓冲区，迫使设备回传非零个数。
-  2. 对已经单调递增、天然无重复的索引（如 `torch.nonzero(cond, as_tuple=False).squeeze(-1)`）冗余调用 `.unique()`，触发额外排序与动态长度同步。
-- **After 手法**：
-  - 掩码赋值改为 `torch.where(cond, a, b)` 或算术表达（如 `back -= kept.to(back.dtype)` 替代 `back[kept] -= 1`）。
-  - 需按掩码抽取元素且下游接受索引表时，用 `kept_indices = torch.nonzero(kept, as_tuple=False).flatten()` 配合 `torch.index_select`（并确认前后分配链是否仍触发同步）；已知上界时改用固定大小缓冲区 + 有效 mask。
-  - 经确认输入天然唯一且无需重排时，直接删除冗余 `.unique()`。
-- **前提与不适用**：
-  - 若固定形状 + mask 方案引入大量无效计算，需实测权衡同步收益与多余计算开销。
-  - 删 `.unique()` 前必须证明上游索引严格无重复且下游不依赖额外排序副作用。
-- **最小验证**：覆盖全 0、全 1、单元素、空结果边界；验证选中与未选中位置的反向梯度一致。
+## P5 延迟或合并指标读回
 
----
+- **Before**。非日志微步、非输出 rank 或前向阶段过早把 loss 物化为 Python 数值。多个标量逐项归约和读回，或每步马上等待指标。
+- **After**。对确认不会消费的微步跳过物化。前向仅为指标保留 `.detach()` 张量，消费端负责在实际日志边界物化，两端成组启停与回退。多个指标可堆叠后单次归约和 D2H。允许滞后时可用 pinned buffer 和事件在稍后读取，参照 P8。
+- **前提与反例**。核对所有消费点和 rank 的键序、dtype 提升、缩放、步号及容差。即时早停、动态调参、best checkpoint 等消费者需原有时序。及时释放未消费指标，收尾按契约执行 `flush()`。
+- **最小验证**。梯度累积为 1 和大于 1、非输出 rank、多 rank 归约、最后一笔指标和正常/异常收尾。
+- **证据状态**。DiT4DiT、LeRobot-ACT、BEVFusion 和 OpenWAM 对应改写为「已核实改造案例」。ACT 的回传类型与 logger 包装构成强耦合组。OpenWAM side stream 路径依赖异步集合与后端契约。
 
-## P4 绕开高层 varlen / Attention 封装里的隐式 `.max().item()` `[已核实改造案例]`
+## P6 缩小显式同步的范围
 
-- **Before 坏味道**：FlashAttention 等高层封装（或 `_update_causal_mask`）在内部对 `seqlens` 做 `torch.nonzero` + `.max().item()` 或反复构建 `cu_seqlens` / `chunk_lengths`。
-- **After 手法**：
-  - 在可验证的特定前提下（如 FA2 + prefill + 右 padding 无前置 0），直接返回 `None` 绕开 unpad/varlen 路径（可保留一次低成本右 padding 校验，不满足时显式回退原函数）。
-  - 对已知打包结构或可缓存的 `grid_thw`，预构造/缓存 `cu_seqlens`、`chunk_lengths` 直接传给底层实现。
-- **前提与不适用**：
-  - 强依赖序列布局假设（如右 padding、batch=1 打包、`past_seen_tokens == 0`），**必须显式校验前提并在不满足时回退**（或用 `torch._check` 声明），严禁静默走错分支。
-  - 若改动目的是消除 `torch.compile` 重编译（如 `max_seqlen` 分桶），归 `torch-compile-integration` 主导。
-- **最小验证**：分别构造满足前提（右 padding）与不满足前提（左 padding、含 cache、变长）的输入，确认输出与梯度均与原路径一致且不满足时确实走回退。
+- **Before**。`dist.barrier()` 在每个累积微步运行，或诊断计时器在训练热路径同步设备。
+- **After**。只保留任务确实需要的同步步骤。确认无消费者依赖诊断计时后，可用对应框架版本支持的开关关闭计时或同步。
+- **前提与反例**。把同步移入日志分支前，检查分布式一致性、异常传播、buffer 生命周期与 checkpoint 可见性。「正确性保护（非提速）」包括落盘依赖的 staging 确认及跨 rank 失败传播。
+- **最小验证**。对照微步和 optimizer step 的集合同步次数，测试多 rank 日志/GC、保存、恢复和异常路径。
+- **证据状态**。LingBot-VA `barrier()` 收到 `should_log` 为「已核实改造案例」，日志分支的设备同步保留。OpenWAM 的 DeepSpeed throughput 配置为「受限/单框架参考」「版本兼容性待核对」。
 
----
+## P7 CPU 求解边界的批量拷贝
 
-## P5 指标聚合、梯度累积跳过与延迟读取 `[已核实改造案例]`
+- **Before**。CPU SciPy 求解接收完整代价矩阵，匹配的行索引和列索引分别 H2D。
+- **After**。代价矩阵仍一次 D2H。把行列索引在主机 `np.stack`，一次 H2D 后在设备上 `unbind`。
+- **前提与反例**。索引形状、dtype、次序和空结果必须兼容，矩阵变大时复查 CPU 求解成本。只隔离 SciPy 段到编译图外时，交编译专项处理捕获边界。
+- **最小验证**。检查空匹配、并列代价、最终分配和 D2H/H2D 次数。保留正常 CPU 求解路径可回退。
+- **证据状态**。BEVFusion 结果 H2D 从两次合为一次，为「已核实改造案例」。MapTRv2 是编译边界交接案例。
 
-- **Before 坏味道**：
-  1. **梯度累积微步白同步**：每个 micro-step 末尾都对 loss 调用 `.item()`，但外层仅在 `sync_gradients=True`（真正 optimizer step）才打日志。
-  2. **前向内部过早物化**：`model.forward()` 返回 `loss_dict` 时立刻调 `.item()`，即使本步不记录日志或本 rank 不输出。
-  3. **逐项归约与逐项读回**：循环内对多个 loss 分别 `dist.all_reduce` + `.item()`。
-  4. **每步阻塞读回**：每个 optimizer step 立刻同步读取 loss / `grad_norm` 排空 GPU 队列。
-- **After 手法（按侵入度由低到高）**：
-  1. **微步跳过**：在 `not sync_gradients`（非日志步）直接返回 `{}` 或保留设备张量，不调用 `.item()`。
-  2. **推迟到日志边界（强耦合原子组）**：前向内只存 `loss.detach()` 设备张量，仅在 logger/wandb 消费边界才执行 `.item()`——**生产端与消费端必须成组启停与回退**。
-  3. **多标量合并单次归约与单次 D2H**：`torch.stack` 合并全部标量 → 单次 `dist.all_reduce` → 单次 `.cpu().tolist()`。
-  4. **延迟一步异步读取**：拷到 `pin_memory=True` host buffer + `cuda.Event.record()`，在下一步 `push` 时再 `event.synchronize()` + `.tolist()`（若与异步集合通信共存，可在独立 `cuda.Stream` 上 wait 并对源张量调用 `record_stream` 防止 allocator 提前复用）。
-- **前提与不适用**：
-  - 延迟一步读取要求本步训练控制流不依赖即时指标（如早停、动态调 lr、按本步 loss 选 best checkpoint 需核对步号语义）。
-  - 推迟 `.detach()` 张量时必须确保无引用滞留导致计算图/显存泄漏（务必 `.detach()`，且在非日志步及时丢弃）。
-- **最小验证**：核对日志步号与数值对齐、多 rank 归约值一致、梯度累积开启/关闭时均无未消费张量报错与显存增长。
+## P8 步内非阻塞拷贝的依赖与生命周期
 
----
+- **Before**。小张量阻塞上传或指标立即同步读回，GPU/CPU 消费者等待时机与复制工作耦合。
+- **After**。按目标后端选择 pinned host buffer 和 `non_blocking=True`。异步 D2H 由 CPU 读取时，CPU 必须在读前确认复制完成，例如等待复制结束事件。设备消费者可在消费流等待事件，或使用同流顺序。跨 stream 另外保护 allocator 生命周期，例如对跨流使用的设备张量调用 `record_stream(consumer_stream)`。
+- **前提与反例**。保留 host buffer 直至传输完成。H2D 完成前避免覆盖或复用 pinned 源，D2H 完成前避免读或覆盖目标。pageable 内存可能阻塞，显式 pin 也有开销，核查目标构建和实测重叠。跨流等待与分配器生命周期分别验证。batch 级预取交数据管线。
+- **最小验证**。核对设备、pinned 状态、事件发生在复制之后、CPU 读取发生在完成之后及正常收尾。检查跨流复用、多 rank 数据一致性和端到端时间。
+- **证据状态**。OpenWAM 阻塞指标改为 pinned 延迟读回，为「已核实改造案例」。其小张量 `upload` 和与 `deferred_gather` 联动的侧流属于该实现的受限参考。
 
-## P6 消除库与训练循环中多余的显式同步 `[已核实改造案例]`
+## 受限补充
 
-- **Before 坏味道**：
-  1. 训练循环把 `torch.cuda.synchronize()` 或 `dist.barrier()` 写在梯度累积判断之外，导致每个 micro-step 强制全卡同步。
-  2. 分布式框架/计时器默认开启每步同步（如 DeepSpeed `timers.throughput` 默认在 `engine.step` 内调用同步）。
-- **After 手法**：
-  - 将 `barrier()` / 显式同步收回到真正需要的日志、GC 或 checkpoint 分支内（仅在 `should_log` / 真正 optimizer step 触发）。
-  - 通过框架配置开关关闭纯诊断/计时用同步（如 `timers.throughput = {"enabled": False, "synchronized": False}`）。
-- **前提与不适用**：
-  - **正确性保护（非提速）**：checkpoint 落盘前后的 `staging_stream.synchronize()` / `dist.barrier()`、分布式 OOM/异常汇总前的同步，属于正确性保护，不应作为性能瓶颈删除。
-  - 删除显式同步前，需核实后续代码没有隐式依赖该同步点来保证 buffer 可释放或文件可见。
-- **最小验证**：开启与关闭梯度累积（`grad_accum=1` 与 `>1`）各跑通多步，确认日志、checkpoint 保存/恢复与多 rank 行为正常。
-
----
-
-## P7 必须留在 CPU 的求解收敛为单次 D2H / H2D `[已核实改造案例]`
-
-- **Before 坏味道**：匈牙利匹配（`scipy.optimize.linear_sum_assignment`）等纯 CPU 求解函数内部夹杂零散的 `.item()` 或多次分片搬运，或被错误包进 `torch.compile` 区域。
-- **After 手法**：把完整代价矩阵一次性 `.detach().cpu()` 搬到主机求解，结果 `np.stack` / `torch.as_tensor(..., device=device)` 一次性搬回设备，并保持在编译图边界之外。
-- **前提与不适用**：这是“收敛为一次”而非“彻底消除”；若匹配矩阵尺寸显著增大，需重新评估 CPU 求解本身是否成为瓶颈。
-- **最小验证**：确认整个求解函数只触发 1 次 D2H + 1 次 H2D，且匹配结果与原实现完全一致。
-
----
-
-## P8 步内非阻塞拷贝的安全条件 `[已核实改造案例]`
-
-> 范围说明：本条仅服务于步内小张量 H2D/D2H 与延迟指标异步拷贝（如 `P5`）。DataLoader 架构改造（`pin_memory`/`persistent_workers`、batch 级独立 H2D 预取流）归**数据管线**方向主导。
-
-- **Before 坏味道**：盲目加 `tensor.to(device, non_blocking=True)` 或 `host.copy_(dev, non_blocking=True)`，但未确认源/目标主机内存已 pinned，或在非默认 stream 上缺少同步等待与 `record_stream` 保护。
-- **After 手法**：
-  1. 确保主机侧张量来自 `pin_memory=True`（或对小张量显式 `.pin_memory()`），否则 `non_blocking=True` 静默退化为同步拷贝。
-  2. 在真正消费数据前建立明确同步点（`event.synchronize()`、`stream.wait_event()` 或同 stream 串行化）。
-  3. 跨 stream 传递张量时，对在源 stream 分配、在另一 stream 消费的张量调用 `tensor.record_stream(consumer_stream)`，防止缓存分配器提前复用显存。
-- **最小验证**：核查“改了没变快”→ 是否未 pinned 或消费点过早等待；核查“变快但偶尔出错”→ 是否缺少同步点或 `record_stream`。
-
----
-
-## 通用不适用场景
-
-- 纯 CPU 数据预处理路径（不涉及 GPU 队列，优化它属于 CPU/数据管线问题）。
-- 已经在 `torch.compile` 区域内部触发的 graph break（优先交 `torch-compile-integration` 诊断）。
-- 一次性初始化或 checkpoint 加载期的 `.item()`（不在训练热路径，收益可忽略）。
-- 承担 NaN/Inf 即时拦截或分布式一致性保护的同步点（若确需权衡，必须单标「正确性保护（非提速）」并由用户拍板）。
+- **矩阵求逆错误检查（`torch.linalg.inv_ex`）**：将 `torch.inverse` 改为 `torch.linalg.inv_ex(..., check_errors=False)` 可避免隐式错误检查同步，但会放弃奇异矩阵自动抛错。仅限已证明上游矩阵可逆或显式处理 `info` 的受限场景，保留错误检查的回退路径属于「正确性保护（非提速）」。详见 [证据文档 §3](turbophysai-sync-evidence.md) 与 [validation.md](validation.md)。
