@@ -1,46 +1,39 @@
-# 慢 Rank 分流、Trace T5 口径与 HIP/RCCL 死锁防护
+# 慢 rank 分流、T5 口径与 HIP/RCCL 正确性保护
 
-本文处理分布式通信优化中最容易踩的两个坑：**① 把慢 rank 偏斜误判成通信重叠不足**；**② 在 ROCm/HIP（RCCL）上改写通信流导致多卡乱序死锁**。
+## 1. 先排慢 rank
 
----
+T5 的暴露通信是通信 kernel 区间并集中未被计算 kernel 覆盖的时间。集合 kernel 可能包含等待其他 rank 到达的时间。先用 `trace-bottleneck-report` 的 §1 总览、§3 空闲归因和 §6 T5 判断等待从哪里来。
 
-## 1. 先排慢 Rank，再做通信重叠（对接 `trace-bottleneck-report` T5）
+| 信号 | 核对与交接 |
+| --- | --- |
+| 暴露高且集合起始极差大、集合序列不齐或个别 rank 明显偏慢 | 对照同阶集合前的 CPU 事件、GPU 空闲和非通信计算。等待 batch、阻塞 H2D → 数据管线，周期 GC 或分配器抖动 → 显存与重算，步内 D2H/多余 barrier → 同步消除。同时核对有效 token、负载和设备状态。 |
+| 可比的 rank 到达齐整，目标集合暴露高 | 查实际并行包装、通信流与依赖，先选相关的 C1–C4 公开路径。 |
+| 集合次数多、消息小 | 查 FSDP2 单元粒度或 DDP/ZeRO bucket。图切分由编译专项主导，通信侧验收 backward overlap。 |
+| 传输负载可能冗余 | 查 C3 权重常驻、C5 重复全量 gather，或经授权的 C7 owner 归约。比较调用链、消息口径与数据布局。 |
 
-通信 kernel（`nccl*` / `rccl*`）的耗时包含两部分：**真正的数据传输时间** + **早到 rank 等最慢 rank 到达集合点的时间**。如果快卡一直在等慢卡，调大 bucket、开 prefetch 或重写 AllGather 流水都不会有收益。
+`--slow-rank-ms` 只控制 §3 是否追加空闲最多 rank 的详细归因，阈值计算是它与报告所选 detail rank 的空闲时长差。T5 起始极差按各 rank 窗口内第 k 次同类集合配对，次数不齐时跳过。脚本把 step 起点差小于 50 ms 当作时钟可比的启发式，不能自动识别或校准多机时钟。已知多机且无法校时、缺 rank 或序列无法对齐时，使用每 rank 的非通信计算、空闲、步长与同类集合耗时对照，标明推断。算法带宽基于平均消息字节和平均 kernel 时长，比较前先核对字段可用性、集合和拓扑。
 
-按 `trace-bottleneck-report` 的 §1（最慢 rank）与 §6（T5 通信表）做分流：
+## 2. HIP/RCCL 正确性保护
 
-| Trace 观察信号 | 根因判断 | 主导动作 |
-| --- | --- | --- |
-| T5 暴露通信高，**但起始极差（中位/最大）大**，或 §1 显示某 rank 空闲/step 显著偏慢（`> --slow-rank-ms`） | **假通信瓶颈（慢 rank 偏斜）** | **暂停通信重叠改造**；对比慢 rank 与快 rank 的 DataLoader 耗时、变长序列/有效 token 数、单卡 GC 尖刺、设备频率/温度或外部进程干扰 |
-| 各 rank 起始极差小（时钟可比且基本齐整），但 T5 **重叠率低**、**暴露占通信%高** | **真通信暴露（重叠不足）** | 进入本 Skill 的 `C1`–`C4`（必要时 `C6`–`C8`）提高通信与计算重叠 |
-| 各 rank 齐整且重叠率已较高，但 T5 **集合次数极多 / 平均字节极小**（算法带宽远低于链路带宽） | **小包碎通信** | 优先看 `C3`（合并 FSDP2 `fsdp_layers_per_group`）、`C1`（关闭 `optimize_ddp` 碎图）或 `C4`（调大 `reduce_bucket_size`） |
-| 通信总字节数本身异常偏大（如全卡重复 `all_gather` 或偏斜 `ReduceScatter` 零填充） | **冗余通信量** | 优先看 `C3`（`reshard_after_forward=False`）、`C5`（owner 分片 + `all_to_all_single`）或二级 `C7`（owner 定向 Reduce） |
+R1–R3 来自 Cosmos3 的受限案例，都标为「正确性保护（非提速）」。通过目标后端、版本和多步边界验证后采用。
 
-> **多机时钟不可比提示**：`trace-bottleneck-report` 检查各 rank step 起点差 `>= 50 ms`（或多机环境）时会把起始极差标为“不可比”。此时不能靠绝对时间戳算极差，改用各 rank **非通信计算+空闲时长分布**、步长中位数差异与通信 kernel 内最慢/最快耗时极差交叉推断是否存在慢 rank。
+### R1 同 ProcessGroup 规范提交流
 
----
+- 同一通信器上，各 rank 必须按相同次序提交集合。把共享组的相关调用统一到每个 `(device, process_group)` 的规范提交 stream，显式接上生产依赖和消费等待。Cosmos3 同时接管 FSDP2 AllGather/ReduceScatter、部分 AllReduce 与 DTensor 范数归约。核对目标版本能否安装这些 hook。
+- 核对异步 work 的等待点和张量生命周期。可以用 `record_stream()` 告知分配器，或显式管理事件、张量持有和回收顺序。单 stream 可能减少并发，验收观察代表路径中的序列与超时。
 
-## 2. HIP / RCCL 正确性保护（非提速）
+### R2 DCP 保存元数据使用独立 Gloo 组
 
-以下 3 条机制用于**预防多卡死锁与通信器崩溃**，在分析与实施交付中必须单标为 **「正确性保护（非提速）」**，绝不混入性能增益候选，也不得在后续调优时被误删：
+- 受影响的 HIP/RCCL 运行时，DCP 保存规划的对象集合可能失败。Cosmos3 只在 `save_state_dict_worker` 传入元数据组。自动模式要求已初始化、HIP 和 GPU 通信后端。支持显式选 Gloo 或禁用该分支。版本兼容性待核对。
+- 确认所有相关 rank 同序参与懒建组和保存，核对 Gloo 可用性以及组的退出清理。目标环境中验证实际保存、加载与异常退出。
 
-### R1 单 ProcessGroup 规范提交流（防 RCCL 多 stream 乱序死锁）`「正确性保护（非提速）」`
-- **背景与风险**：FSDP2 或自定义异步通信可能从多个 CUDA/HIP stream 向同一个 `ProcessGroup` 提交集合通信。RCCL 要求同一 communicator 上各 rank 的集合调用保持严格一致的全局提交顺序，多 stream 并发提交极易在不同 rank 间交错导致永久 hang（死锁）。
-- **做法**：为每个 `(device, process_group)` 维护一条规范（canonical）提交 stream；每次提交集合前用 `collective_stream.wait_stream(caller_stream)` 接力，在规范 stream 上提交 `all_gather_into_tensor` / `reduce_scatter_tensor` / `all_reduce`，再让调用方 stream 按需 `wait_stream`（或通过 FSDP2 `set_custom_all_gather` / `set_custom_reduce_scatter` 统一接管）。
-- **代偿**：单 stream 串行化提交可能略微约束跨流并发，属于**以可控开销换取零死锁的正确性保护**。
+### R3 动态分支的 collective 序列对齐
 
-### R2 元数据集合切独立 Gloo Group（规避 RCCL `gather_object` 故障）`「正确性保护（非提速）」`
-- **背景与风险**：在部分 HCU/RCCL 构建上，PyTorch Distributed Checkpoint（DCP）等路径通过 NCCL/RCCL 后端执行 Python 对象序列化收集（`gather_object`）可能失败或卡死，即使普通张量通信正常（「版本兼容性待核对」）。
-- **做法**：懒创建一个独立 CPU/Gloo 后端的 `ProcessGroup`（`dist.new_group(backend="gloo")`），专门传给 DCP 元数据收集接口，与训练张量通信组完全隔离。
+- 核对 CFG、采样步数及失败分支的后端调用序列。若某 rank 少调用一次，也需通过全局 `any/MAX` 与必要的 dummy forward，发出相同顺序、数量及兼容形状的 collective。局部结果按原语义选择，丢弃占位结果。
+- Cosmos3 Before 已有 CFG/步数对齐，After 重排调用并补全 dummy 分支。在多 rank 测不同 CFG 条件、采样步数和分支结果。额外计算单独记录为正确性代价。
 
-### R3 条件分支下的 FSDP / 分布式 Collective 次数对齐 `「正确性保护（非提速）」`
-- **背景与风险**：当不同 rank 走不同控制流分支（如动态采样步数、按 batch 内容决定是否执行 CFG 文本分支）时，FSDP 会在某些 rank 多触发一次或少触发一次 `AllGather`，直接触发分布式死锁。
-- **做法**：在进入条件分支或动态循环前，先做一次全局规约（如 `any` / `max`）对齐所有 rank 的分支标志或迭代上限；本 rank 不需要额外计算时，补跑 dummy forward（保持 FSDP collective 序列完全对齐）后丢弃输出。
+## 3. 多通信组与在途工作
 
----
+独立组可将 C8b 的广播与小指标集合隔离。先确认所有相关 rank 同序创建、提交和清理组，按目标后端要求同步跨组的在途 work。对新通信器测实际显存变化。所有读取共享权重或释放缓冲的路径要先等其生产工作。部分发布失败时排空或按后端失败策略退出，禁止用半更新状态续跑。
 
-## 3. 多 ProcessGroup 与异步通信器的隐蔽风险
-
-- **避免与业务小通信争队列**：像 `deferred_gather` 这类跨步在后台持续运行的重型 broadcast，如果复用默认 `ProcessGroup`，会卡住步末的小指标 `all_gather` / `all_reduce`。为后台长通信建独立 `ProcessGroup` 可以解耦队列，但每增加一个 NCCL/RCCL 通信器都会额外占用数百 MB 级显存，须核对显存预算。
-- **跨 stream 张量生命周期**：只要在 Stream A 分配张量、在 Stream B 等待集合完成或拷贝它，必须对涉及张量调用 `tensor.record_stream(stream_B)`，防止缓存分配器提前复用引发静默数据污染。
+案例与源码位置见 [TurboPhysAI 证据](turbophysai-comm-evidence.md)。

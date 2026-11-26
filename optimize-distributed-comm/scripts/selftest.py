@@ -164,9 +164,196 @@ def test_python_and_configs(tmpdir):
     assert hi_findings and all(f["severity"] == "high" for f in hi_findings)
 
 
+def test_config_boundaries(tmpdir):
+    cases = (
+        ("stage3.yaml", "zero_optimization:\n  stage: 3\n  overlap_comm: false\n", [], False),
+        ("unrelated.yaml", "pipeline:\n  contiguous_gradients: false\n", [], False),
+        ("block_string.yaml", "notes: |\n  overlap_comm: false\n", [], False),
+        ("inline.yaml", 'zero_optimization: {"stage": 2, overlap_comm: false} # note\n',
+         ["ds_overlap_comm_disabled"], False),
+        ("inline_nested.yaml", "zero_optimization: {stage: 2, extra: {a: 1, overlap_comm: false, z: 0}}\n",
+         [], True),
+        ("mixed_case.yaml", "zero_optimization: {stage: 2, overlap_comm: fAlSe}\n", [], False),
+        ("missing_space.yaml", "zero_optimization:\n  stage: 2\n  overlap_comm:false\n", [], True),
+        ("quoted_keys.yaml", 'zero_optimization: {"stage":2,"overlap_comm":false}\n',
+         ["ds_overlap_comm_disabled"], False),
+        ("root_multiline.yaml", 'notes: "some text\nzero_optimization: {stage: 2, overlap_comm: false}\n'
+         'next: more"\n', [], True),
+        ("root_flow.yaml", "other: {\nzero_optimization: {stage: 2, overlap_comm: false}\n}\n",
+         [], True),
+        ("root_explicit.yaml", "zero_optimization: {stage: 2, overlap_comm: false}\n"
+         "? zero_optimization\n: {stage: 3}\n", [], True),
+        ("root_escaped.yaml", 'zero_optimization: {stage: 2, overlap_comm: false}\n'
+         '"zero_optimiza\\u0074ion": {stage: 3}\n', [], True),
+        ("nested.yml", "zero_optimization:\n  stage: 2\n  extra:\n    overlap_comm: false\n", [], False),
+        ("anchor.yaml", "defaults: &defaults\n  stage: 2\nzero_optimization:\n  <<: *defaults\n"
+         "  overlap_comm: false\n", [], True),
+        ("anchored_stage.yml", "zero_optimization:\n  stage: &stage 2\n  overlap_comm: false\n", [], True),
+        ("duplicate.yml", "zero_optimization:\n  stage: 2\n  stage: 3\n  overlap_comm: false\n", [], True),
+        ("second_doc.yml", "zero_optimization: {stage: 2, overlap_comm: false}\n"
+         "---\nzero_optimization: {stage: 3}\n", [], True),
+        ("boolean.json", '{"zero_optimization": {"stage": true, "overlap_comm": false}}', [], False),
+        ("zero2.json", '{"zero_optimization": {"stage": 2, "overlap_comm": false}}',
+         ["ds_overlap_comm_disabled"], False),
+    )
+    errors = []
+    for name, source, expected, warns in cases:
+        path = os.path.join(tmpdir, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        out, err = _run([sys.executable, SCAN_SCRIPT, "--json", path])
+        result = [finding["pattern"] for finding in json.loads(out)]
+        skipped = "unsupported YAML" in err
+        if result != expected or skipped != warns:
+            errors.append((name, expected, result, warns, skipped))
+    assert not errors, "Config mismatch (file, expected, actual, warning expected/actual): %r" % errors
+
+    path = os.path.join(tmpdir, "json_location.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write('{"metadata": {"overlap_comm": true},\n'
+                     ' "zero_optimization": {"stage": 2,\n'
+                     ' "overlap_comm": false}}\n')
+    out, _ = _run([sys.executable, SCAN_SCRIPT, "--json", path])
+    assert [(f["line"], f["pattern"]) for f in json.loads(out)] == [(3, "ds_overlap_comm_disabled")]
+
+
+def test_python_bindings(tmpdir):
+    path = os.path.join(tmpdir, "bindings.py")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "import torch\n"
+            "import torch.distributed as td\n"
+            "from torch.distributed import reduce_scatter_tensor as rs\n"
+            "from torch.distributed.fsdp import FullyShardedDataParallel as Wrap, fully_shard as shard\n"
+            "from torch.nn.parallel import DistributedDataParallel as WrapDDP\n"
+            "from accelerate.utils import DistributedDataParallelKwargs as DDPConfig\n"
+            "from other import dist, DDP\n"
+            "def setup(model, blocks, options):\n"
+            "    DDP(model, find_unused_parameters=True)\n"
+            "    DDPConfig(find_unused_parameters=True)\n"
+            "    Wrap(model, **options)\n"
+            "    WrapDDP(model, **options)\n"
+            "    config = dict(reshard_after_forward=True)\n"
+            "    WrapDDP(model, **{'find_unused_parameters': True})\n"
+            "    shard(model, **config)\n"
+            "    shard(model, reshard_after_forward=2)\n"
+            "    shard(model)\n"
+            "    config['reshard_after_forward'] = False\n"
+            "    shard(model, **config)\n"
+            "    with cache.stream(s):\n"
+            "        td.all_reduce(t)\n"
+            "    with torch.cuda.stream(s):\n"
+            "        dist.all_reduce(t)\n"
+            "        td.all_reduce(t)\n"
+            "    for layer in blocks:\n"
+            "        rs(t, t)\n"
+            "def shadow(td):\n"
+            "    td.all_reduce(t)\n"
+        )
+    out, _ = _run([sys.executable, SCAN_SCRIPT, "--json", path])
+    result = {(f["line"], f["pattern"]) for f in json.loads(out)}
+    expected = {
+        (10, "ddp_find_unused_true"),
+        (14, "ddp_find_unused_true"),
+        (14, "ddp_conservative_defaults"),
+        (15, "fsdp2_reshard_after_forward_true"),
+        (17, "fsdp2_implicit_reshard"),
+        (21, "collective_call"),
+        (24, "collective_in_custom_stream"),
+        (26, "collective_in_loop_sync"),
+    }
+    assert result == expected, (result - expected, expected - result)
+
+
+def test_missing_input(tmpdir):
+    path = os.path.join(tmpdir, "missing.py")
+    result = subprocess.run(
+        [sys.executable, SCAN_SCRIPT, "--json", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    assert result.returncode != 0 and path in result.stderr, result
+
+
+def test_async_call_and_fallback(tmpdir):
+    samples = {
+        "positional.py": (
+            "import torch.distributed as dist\n"
+            "for t in tensors:\n"
+            "    dist.all_reduce(t, dist.ReduceOp.SUM, None, True)\n"
+            "    dist.all_reduce(t, dist.ReduceOp.SUM, None, False)\n"
+            "    dist.all_reduce(t, *options)\n",
+            [(3, "collective_call"), (4, "collective_in_loop_sync"), (5, "collective_call")],
+        ),
+        "nested_scopes.py": (
+            "import torch.distributed as dist\n"
+            "from torch.nn.parallel import DistributedDataParallel as DDP\n"
+            "config = dict(find_unused_parameters=True)\n"
+            "try:\n"
+            "    config['find_unused_parameters'] = False\n"
+            "finally:\n"
+            "    DDP(model, **config)\n"
+            "[dist.all_reduce(t) for dist in custom_backends]\n"
+            "factory().dist.all_reduce(t)\n",
+            [],
+        ),
+        "wrapper_args.py": (
+            "from torch.distributed.fsdp import FullyShardedDataParallel as FSDP\n"
+            "from torch.nn.parallel import DistributedDataParallel as DDP\n"
+            "FSDP(model, group, strategy, backward_prefetch)\n"
+            "DDP(*wrapper_args)\n"
+            "DDP(model, static_graph=True, find_unused_parameters=True, gradient_as_bucket_view=True)\n",
+            [],
+        ),
+        "class_scope.py": (
+            "import torch\n"
+            "from other import dist\n"
+            "class State:\n"
+            "    import torch.distributed as dist\n"
+            "    def launch(self, s, t):\n"
+            "        with torch.cuda.stream(s):\n"
+            "            dist.all_reduce(t)\n",
+            [],
+        ),
+        "match_scope.py": (
+            "import torch\n"
+            "import torch.distributed as dist\n"
+            "match other_backends:\n"
+            "    case {'preferred': dist}:\n"
+            "        with torch.cuda.stream(s):\n"
+            "            dist.all_reduce(t)\n",
+            [],
+        ),
+        "syntax.py": (
+            "print('find_unused_parameters=True')\n"
+            "# find_unused_parameters=True\n"
+            "x =\n"
+            "DDP(model, find_unused_parameters=True)\n",
+            [(4, "ddp_find_unused_true")],
+        ),
+    }
+    mismatches = []
+    for name, (source, expected) in samples.items():
+        path = os.path.join(tmpdir, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        out, err = _run([sys.executable, SCAN_SCRIPT, "--json", path])
+        result = [(f["line"], f["pattern"]) for f in json.loads(out)]
+        if result != expected:
+            mismatches.append((name, result, expected))
+        if name == "syntax.py":
+            assert "using regex fallback" in err
+    assert not mismatches, mismatches
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         test_python_and_configs(tmpdir)
+        test_config_boundaries(tmpdir)
+        test_python_bindings(tmpdir)
+        test_missing_input(tmpdir)
+        test_async_call_and_fallback(tmpdir)
     print("PASS: scan_comm_candidates.py self-tests succeeded.")
     return 0
 
