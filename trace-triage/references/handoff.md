@@ -11,6 +11,7 @@
 | **慢 rank 排查** | §1 最慢 rank、§3 最慢 rank 补充归因、§6 集合通信起始极差 | **先于通信重叠排查**：对比该 rank 的数据加载、GC 抖动、设备状态与外部负载；若为单卡数据加载/IO 偏慢交 **`opt-dataloader`**，若为周期性偶发步长尖刺/轮换慢 rank 交 **`opt-memory`** 排查 Python GC 与热路径 `empty_cache()` |
 | **通信重叠** | §6 暴露占通信%、重叠率、起始极差；§1 暴露通信 | **`opt-distributed`**（梯度归约重叠、按 owner 归约、AllGather 流水、FSDP/DDP/ZeRO-2 通信策略；起始极差大时先按其分流规则查慢 rank 根因） |
 | **显存 / 重算**（不进排行，单列） | 峰值显存 `allocated/reserved` 余量或 OOM、反向重算占比、周期性步长尖刺 | **`opt-memory`**（显存富余时减 AC / 上 SAC 换吞吐；显存紧绷时关训练 KV cache、压激活/碎片；多卡周期抖动时 warmup 后 `gc.freeze()`） |
+| **后端运行时环境变量**（零代码侵入，单列） | §2 GEMM/Conv/编译/通信/显存热点，结合运行记录（`command.json`/环境变量）发现显式关闭 TF32、缺失或可疑的后端启动开关（如 `HIPBLASLT_ALLOW_TF32`、`MIOPEN_FIND_MODE`、`PYTORCH_CUDA_ALLOC_CONF`、`NCCL_RINGS`） | **`opt-runtime-env`**（仅改启动配置/环境变量，不改源码；把热点与运行记录中的环境证据一并交接，源码扫描留到下游按需执行） |
 
 ## 交接使用规则
 

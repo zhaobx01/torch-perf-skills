@@ -13,7 +13,7 @@
   - 覆盖变长、等长（dense vs varlen）、空 batch、全 mask、causal 与非 causal、GQA（`repeat > 1`）与等头宽（`repeat == 1`）。训练路径比较反向梯度及 NaN/Inf。冻结前向路径核对梯度边界。关闭 MHA 权重计算或平均前，验输出形状及消费者。
   - FlexAttention 专项：验证 `H=1` 共享 `BlockMask` 与原 `H=num_heads` 构造等价；覆盖序列长度能整除与不能整除 `block_size`/tile 的边界；验证 tile 整除 `SPARSE_*_BLOCK_SIZE`；若开启 TF32 精度（如 `flex_attn_tf32`），验证 `torch.compiler.config.cache_key_tag` 已变化、不复用旧 `ieee` 缓存，并单独核验前反向精度与收敛曲线。
   - 架构白名单模板分别验证命中、未命中和非法契约。核对回原派发、走默认配置或明确报错与设计一致，合法路径输出满足容差。涉及私有钩子时还要检查作用域和当前构建。
-- **归一化、RoPE 与线性层**：覆盖最后一维刚好等于和小于阈值、非连续输入、不同 dtype、空 batch；复数→实数 RoPE 确认保持原精度（如 `float64`）；带 RoPE 频率缓存的包装确认缓存不进入 `state_dict()` 且变 shape 时有界释放；2D `addmm` 替换重点核对 BF16 舍入敏感层。
+- **归一化、RoPE、线性层与敏感几何子计算**：覆盖最后一维刚好等于和小于阈值、非连续输入、不同 dtype、空 batch；复数→实数 RoPE 确认保持原工作精度（如 `float64`）并恢复输出 dtype；带 RoPE 频率缓存的包装确认缓存不进入 `state_dict()` 且变 shape 时有界释放；2D `addmm`/线性融合重点核对 BF16 舍入敏感层（如明确排除 `action_embedder` 等保护路径）；对几何池化/投影类敏感子区（如 `bev_pool` 在 `fp16_enabled` 时先升宽张量及 NamedTuple 字段再关 autocast，或 `point_sampling` 局部关 `allow_tf32`），确认进入子区无残留低精度、局部关 TF32 时分别保存 `matmul`/`cudnn` 原值并在 `try/finally` 中恢复。
 - **`custom_op`、定点 Triton 与原生 C++/HIP 扩展**：
   - 在 eager 与 `torch.compile` 下各跑通前向和反向；确认 `register_fake` 返回的 shape/dtype/device 与真实输出完全一致。
   - 仅支持一阶梯度的算子（如 `qk_tf32`、`pool_backward_gather`），在开启高阶求导场景验证明确抛 `RuntimeError`。

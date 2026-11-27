@@ -2,7 +2,7 @@
 name: opt-layout
 description: Analyze or implement PyTorch channels_last and channels_last_3d memory layouts for convolutional subgraphs on CUDA or ROCm/HIP. Use for convolution hotspots, repeated layout conversions, or debugging layout propagation. Hand off global compilation and recompilation to opt-compile, and kernel selection to opt-kernel.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Optimize Channels-Last
@@ -19,7 +19,7 @@ metadata:
   - **不改逻辑接口**：物理 `memory_format` 不是 `permute(0,2,3,1)` 后的逻辑 NHWC/NDHWC 接口；不按维数盲改 token、相机维、索引或元数据张量。
   - **vs `opt-compile`**：卷积子图的 `channels_last` 转换边界与局部 stride 保持由本 Skill 主导；全局 `torch.compile` 范围、重编译治理与 `TORCHINDUCTOR_LAYOUT_OPTIMIZATION` 全局开关由 `opt-compile` 主导，消融时分开开关。
   - **vs `opt-kernel`**：融合卷积/厂商算子本身的替换选型（如 hipDNN/DCN 替换、`custom_op` 注册）由 `opt-kernel` 主导；本 Skill 仅负责其输入/权重/缓存的 channels-last 布局契约对齐。
-  - **vs 运行时/后端调优与同步消除**：`PYTORCH_MIOPEN_SUGGEST_NHWC`/`NDHWC` 作为 ROCm 布局生效前提由本 Skill 主导核查；`MIOPEN_FIND_MODE`（算法搜索策略）、TF32/GEMM 精度开关仅作消融隔离与分流提示，不展开调参；`.item()`/`.cpu()` 同步问题交 `opt-sync`。
+  - **vs `opt-runtime-env` 与 `opt-sync`**：`PYTORCH_MIOPEN_SUGGEST_NHWC`/`NDHWC` 作为 ROCm 布局生效前提在改布局代码时由本 Skill 联合核查；仅修改启动环境变量（如 `MIOPEN_FIND_MODE`、`MIOPEN_FIND_ENFORCE` 或 TF32/GEMM 开关，不改模型布局源码）交 `opt-runtime-env`；`.item()`/`.cpu()` 同步问题交 `opt-sync`。
 
 ## 工作模式（按当次用户授权判定）
 

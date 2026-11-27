@@ -68,6 +68,7 @@ AOT 需另外核对导出覆盖、示例 batch/dtype/device/layout、权重绑�
 
 - **先看 `recompiles` guards 再选方案**：先确定变化的 guards，再考虑参数分桶或形状契约。分桶只改变允许取上界的参数，保留真实长度与消费者；`_check` 只表达已有不变量，不删除合法空输入或必要检查。调大缓存（如 `recompile_limit`/`cache_size_limit`）仅容纳更多版本；私有设置缺失时的跳过不能当作已生效，也不能证明重编译减少。
 - **装饰器顺序**：装饰器从下到上应用。分别检查 `compile(force_fp32(fn))` 与 `force_fp32(compile(fn))` 实际包装的代码及目标输入 dtype，避免随手换序。
+- **精度 hook 与编译缓存隔离**：修改 Inductor 内部精度行为（如 `get_float32_precision` hook）或局部 `emulate_precision_casts` 时，须配套隔离编译缓存（如设置 `torch.compiler.config.cache_key_tag`、`TORCH_COMPILE_CACHE_KEY_TAG` 或独立缓存目录），防止基线与候选串用生成产物；卸载或回退时同步恢复缓存隔离标记并在新进程复验。
 - **控制流与状态**：带静态循环、容器追加、`ModuleList` 索引的计算可作为候选，需验证循环次数、配置分支及 train/eval 改变时的 guards。输入 `squeeze_`、切片赋值、共享 view、缓存首次构建等可能影响重放、alias 或特化，保持原语义并单独覆盖首次和后续调用。
 - **padding 与离散决策**：padding 必须记录容量、pad 值、mask、length 及消费者。测试 `N=0, 1, 容量-1, 容量, 容量+1`；明确超限行为，不截断有效数据，不移除原始空输入处理来追求静态图。对匹配/排序等离散决策，除数值容差外检查有效索引、padding 过滤和 ties 行为；元数据转换、numpy 输入和 `.to(device)` 追踪到被调用函数，不以 helper 名称判断“纯 Tensor”。
 

@@ -6,7 +6,7 @@ description: >-
   Route compile scope and global Inductor tuning to opt-compile,
   layout propagation to opt-layout, and host-device stalls to opt-sync.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Optimize Kernel Replacement
@@ -24,7 +24,7 @@ metadata:
   - **vs `opt-compile`**：本 Skill 主导单算子实现、后端、tile 选择与局部绕开低效展开，负责局部契约与验收。编译范围、图捕获、重编译和全局 Inductor 钩子／启发式（如 `hip_triton_configs`）由 `opt-compile` 主导。通过全局钩子安装单算子特化时，分别验证安装作用域和算子结果。
   - **vs `opt-sync`**：`.item()`/`.cpu()`/`nonzero` 导致的 GPU 空闲交给 `opt-sync`。
   - **vs `opt-layout`**：2D/3D 卷积子图的 `channels_last`/`channels_last_3d` 布局边界设计交给 `opt-layout`（本 Skill 仅校验目标融合算子所需的输入布局契约）。
-  - **vs `opt-distributed`**：ZeRO/FSDP 的集合调度、重叠和 rank 顺序由通信侧主导，本 Skill 验证局部打包、优化器计算与舍入契约。批加载/H2D 交 `opt-dataloader`，激活重计算交 `opt-memory`。通用算子库研发在本 Skill 范围之外。
+  - **vs `opt-distributed`**：ZeRO/FSDP 的集合调度、重叠和 rank 顺序由通信侧主导，本 Skill 验证局部打包、优化器计算与舍入契约。批加载/H2D 交 `opt-dataloader`，激活重计算交 `opt-memory`。仅调整后端启动环境变量（不改算子源码）交 `opt-runtime-env`。通用算子库研发在本 Skill 范围之外。
 
 ## 工作模式（按当次用户授权判定）
 

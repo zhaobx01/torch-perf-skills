@@ -14,7 +14,7 @@
 | C8a | 查 optimizer 是否在分片前正确 regroup、step 是否排空、失败状态是否阻止重用或保存。验证同布局 checkpoint 往返、缺失/不符清单拒绝与允许的原生 rank-count 回退。 |
 | C8b | 分别验证 eager 按层等待和 compiled 提前排空。覆盖非联合 forward、eval、保存、结束和部分提交失败，核对旁路读取的权重与期待版本一致。 |
 
-比较 loss、梯度和更新参数是否在项目容差内。归约顺序变更可能产生舍入差。评估关键张量及 clipping 边界，检查 NaN/Inf 和 rank 漂移。
+比较 loss、梯度和更新参数是否在项目容差内。归约顺序变更可能产生舍入差；涉及 ZeRO-2 条件通信精度（如 BF16 `communication_data_type` 配合 `zero_reduce_scatter` 与 stage 2）或梯度范数重叠（如 FP64 partials 汇总）时，单独核对生效通信 dtype、关键张量、clipping 临界点、NaN/Inf 与多 rank 一致性。
 
 ## 2. Checkpoint 与多卡稳定性
 

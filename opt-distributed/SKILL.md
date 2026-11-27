@@ -2,7 +2,7 @@
 name: opt-distributed
 description: Analyze or implement PyTorch multi-GPU collective overlap, sharding, and RCCL ordering. Use for exposed collectives, wrapper/config review, or RCCL ordering failures. Triage slow ranks first. Route batch/H2D stalls to opt-dataloader, step-internal sync to opt-sync, and graph capture to opt-compile.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Optimize Distributed Comm
@@ -15,7 +15,7 @@ metadata:
 - batch、DataLoader 或 H2D 等待交 `opt-dataloader`。OpenWAM 冻结编码器的输入准备与调度也由数据管线主导。涉及改写 ZeRO-2 收集或其与编码的重叠时，通信侧主导 gather 的依赖、发射点和进程组顺序，数据管线协同核对 batch 顺序。
 - GC 周期尖刺、热路径分配器抖动或需要腾显存交 `opt-memory`。通信侧在拟用策略下实测缓冲和权重常驻峰值。
 - 步内 `.item()`、`.tolist()` 和多余微步 `dist.barrier()` 交 `opt-sync`。集合序列或权重一致性所必需的同步由通信侧核对。
-- 图捕获、编译范围与 DDP bucket 图切分交 `opt-compile`，通信侧负责包装生效、反向重叠与异步工作边界。单卡 kernel 和布局分别交 `opt-kernel` 与 `opt-layout`，通信侧负责交换协议和参数分片视图。
+- 图捕获、编译范围与 DDP bucket 图切分交 `opt-compile`，通信侧负责包装生效、反向重叠与异步工作边界。单卡 kernel 和布局分别交 `opt-kernel` 与 `opt-layout`，通信侧负责交换协议和参数分片视图。仅调整 NCCL/RCCL 启动环境变量（不改并行代码）交 `opt-runtime-env`。
 
 ## 2. 按当轮授权决定工作模式
 

@@ -8,7 +8,7 @@ description: >-
   graph capture to opt-compile, and collective overlap to
   opt-distributed.
 metadata:
-  version: "1.0.1"
+  version: "1.0.2"
 ---
 
 # Optimize Memory And Recompute
@@ -27,7 +27,7 @@ metadata:
 
 - 离线 VAE/T5 编码与训练数据切换、等待 batch 或 H2D 归 `opt-dataloader`。步内 D2H 或多余同步归 `opt-sync`。
 - FSDP/ZeRO 分片拓扑与集合重叠归 `opt-distributed`。本 Skill 核算 AC、权重常驻和预取叠加时的显存预算。
-- 捕获边界、图断与重编译归 `opt-compile`。卷积布局归 `opt-layout`，算子后端选择归 `opt-kernel`。遇到 AC 与这些改动共用入口时，联合核对并做消融。
+- 捕获边界、图断与重编译归 `opt-compile`。卷积布局归 `opt-layout`，算子后端选择归 `opt-kernel`。遇到 AC 与这些改动共用入口时，联合核对并做消融。仅调整启动环境变量（如 `PYTORCH_CUDA_ALLOC_CONF`、`HIP_BUFFER_EXTRA_SIZE`、`GPU_MAX_HW_QUEUES`，不改代码级 AC/SAC/GC）交 `opt-runtime-env`。
 
 ## 按当轮授权工作
 

@@ -9,7 +9,7 @@ description: >-
   conv layouts to opt-layout, and host-device stalls to
   opt-sync.
 metadata:
-  version: "1.0.1"
+  version: "1.0.2"
 ---
 
 # Torch Compile Integration
@@ -27,6 +27,7 @@ metadata:
   - **vs `opt-dataloader`**：batch 加载、DataLoader H2D 与离线特征缓存归数据管线专项；在数据预取侧做 CPU 分桶以稳住 shape 时与数据管线协同核对字段契约。
   - **vs `opt-memory`**：激活检查点（AC/SAC）覆盖范围与 OOM 显存预算归显存专项；AC/SAC 与编译区域交叉或共用入口时联合核对包装顺序与重编译变体并做消融。
   - **vs `opt-distributed`**：DDP/FSDP/ZeRO 集合通信重叠与 RCCL 顺序归通信专项；启用 `optimize_ddp=False` 减少 DDP bucket 切图时，由通信侧独立验收反向重叠是否退化。
+  - **vs `opt-runtime-env`**：仅调整 Inductor/Triton 启动环境变量（不修改编译代码或边界）交 `opt-runtime-env`；本 Skill 主导代码级 `torch.compile` 接入、精度 hook 缓存隔离及与编译代码联动的环境变量配置。
 - **自包含与离线边界**：全部核心规则、P1–P7 问题索引与跨模型证据均在包内，不依赖联网或外部 Skill。需深挖复杂图中断或解析显存快照时，可使用或推荐用户安装外部 `debug-graph-breaks` / `analyze-memory-snapshot` Skill 协同；未安装或离线时直接按包内 P4 与显存排查要点降级，本 Skill 不自动安装外部 Skill 或依赖。
 
 ## 工作模式（按当次用户授权判定）

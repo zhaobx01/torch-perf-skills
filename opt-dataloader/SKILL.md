@@ -8,7 +8,7 @@ description: >-
   collective overlap to opt-distributed, and compile shape
   contracts to opt-compile.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Optimize Data Pipeline
@@ -19,7 +19,7 @@ metadata:
 
 - **同步消除**处理 forward 或训练步内由 `.item()`、`.cpu()`、`.tolist()`、布尔索引等触发的 D2H。批量 H2D 和下一批等待由本 Skill 主导。
 - **分布式通信**处理集合通信重叠。各 rank 到达集合通信的时间不齐时，先定位慢 rank 的数据等待、GC 或负载偏斜，再决定主导方。OpenWAM ZeRO-2 前瞻编码由通信专项主导，本 Skill 协同验收数据顺序和预取生命周期。
-- **编译集成**处理为稳定图形状而引入的 padding、分桶及其 mask 契约。**显存专项**处理激活重算、GC 抖动和显存回收，本 Skill 验收多 worker、锁页和预取产生的资源增量。
+- **编译集成**处理为稳定图形状而引入的 padding、分桶及其 mask 契约。**显存专项**处理激活重算、GC 抖动和显存回收，本 Skill 验收多 worker、锁页和预取产生的资源增量。仅调整 `TOKENIZERS_PARALLELISM`/`OMP_NUM_THREADS` 等启动环境变量（不改数据管线代码）交 `opt-runtime-env`。
 
 ## 2. 按本次用户授权工作
 
